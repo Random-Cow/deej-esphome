@@ -8,12 +8,25 @@ import (
 	"go.uber.org/zap"
 )
 
+// PulseAudio subscription constants (from pulseaudio/pulseaudio.h)
+const (
+	subscriptionMaskSinkInput          uint32 = 0x0004
+	subscriptionEventFacilityMask      uint32 = 0x000F
+	subscriptionEventTypeMask          uint32 = 0x0030
+	subscriptionEventFacilitySinkInput uint32 = 0x0002
+	subscriptionEventTypeNew           uint32 = 0x0000
+	subscriptionEventTypeChange        uint32 = 0x0010
+)
+
 type paSessionFinder struct {
 	logger        *zap.SugaredLogger
 	sessionLogger *zap.SugaredLogger
 
 	client *proto.Client
 	conn   net.Conn
+
+	newSinkInputCh     chan uint32
+	changedSinkInputCh chan uint32
 }
 
 func newSessionFinder(logger *zap.SugaredLogger) (SessionFinder, error) {
@@ -35,10 +48,47 @@ func newSessionFinder(logger *zap.SugaredLogger) (SessionFinder, error) {
 	}
 
 	sf := &paSessionFinder{
-		logger:        logger.Named("session_finder"),
-		sessionLogger: logger.Named("sessions"),
-		client:        client,
-		conn:          conn,
+		logger:             logger.Named("session_finder"),
+		sessionLogger:      logger.Named("sessions"),
+		client:             client,
+		conn:               conn,
+		newSinkInputCh:     make(chan uint32, 32),
+		changedSinkInputCh: make(chan uint32, 64),
+	}
+
+	// Subscribe to sink-input events (new, change, remove) so we can react
+	// immediately and fight back when other software overrides our volumes.
+	if err := client.Request(&proto.Subscribe{Mask: subscriptionMaskSinkInput}, nil); err != nil {
+		sf.logger.Warnw("Failed to subscribe to PulseAudio sink-input events, volume-spike prevention disabled", "error", err)
+	} else {
+		client.Callback = func(msg interface{}) {
+			event, ok := msg.(*proto.SubscribeEvent)
+			if !ok {
+				return
+			}
+			facility := event.Event & subscriptionEventFacilityMask
+			eventType := event.Event & subscriptionEventTypeMask
+
+			if facility != subscriptionEventFacilitySinkInput {
+				return
+			}
+
+			switch eventType {
+			case subscriptionEventTypeNew:
+				// Non-blocking: buffer absorbs bursts; any overflow is caught by the next periodic refresh.
+				select {
+				case sf.newSinkInputCh <- event.Index:
+				default:
+				}
+			case subscriptionEventTypeChange:
+				// Also non-blocking. Session map uses these to fight back when an app
+				// (Firefox, Spotify, WirePlumber) overrides the volume we set.
+				select {
+				case sf.changedSinkInputCh <- event.Index:
+				default:
+				}
+			}
+		}
 	}
 
 	sf.logger.Debug("Created PA session finder instance")
@@ -49,7 +99,6 @@ func newSessionFinder(logger *zap.SugaredLogger) (SessionFinder, error) {
 func (sf *paSessionFinder) GetAllSessions() ([]Session, error) {
 	sessions := []Session{}
 
-	// get the master sink session
 	masterSink, err := sf.getMasterSinkSession()
 	if err == nil {
 		sessions = append(sessions, masterSink)
@@ -57,7 +106,6 @@ func (sf *paSessionFinder) GetAllSessions() ([]Session, error) {
 		sf.logger.Warnw("Failed to get master audio sink session", "error", err)
 	}
 
-	// get the master source session
 	masterSource, err := sf.getMasterSourceSession()
 	if err == nil {
 		sessions = append(sessions, masterSource)
@@ -65,13 +113,24 @@ func (sf *paSessionFinder) GetAllSessions() ([]Session, error) {
 		sf.logger.Warnw("Failed to get master audio source session", "error", err)
 	}
 
-	// enumerate sink inputs and add sessions along the way
 	if err := sf.enumerateAndAddSessions(&sessions); err != nil {
 		sf.logger.Warnw("Failed to enumerate audio sessions", "error", err)
 		return nil, fmt.Errorf("enumerate audio sessions: %w", err)
 	}
 
 	return sessions, nil
+}
+
+// SubscribeToNewSessions returns a channel that receives the PulseAudio sink-input
+// index each time a new audio stream is created.
+func (sf *paSessionFinder) SubscribeToNewSessions() chan uint32 {
+	return sf.newSinkInputCh
+}
+
+// SubscribeToSessionChanges returns a channel that receives the PulseAudio
+// sink-input index each time an existing audio stream's properties change.
+func (sf *paSessionFinder) SubscribeToSessionChanges() chan uint32 {
+	return sf.changedSinkInputCh
 }
 
 func (sf *paSessionFinder) Release() error {
@@ -96,9 +155,7 @@ func (sf *paSessionFinder) getMasterSinkSession() (Session, error) {
 		return nil, fmt.Errorf("get master sink info: %w", err)
 	}
 
-	// create the master sink session
 	sink := newMasterSession(sf.sessionLogger, sf.client, reply.SinkIndex, reply.Channels, true)
-
 	return sink, nil
 }
 
@@ -113,9 +170,7 @@ func (sf *paSessionFinder) getMasterSourceSession() (Session, error) {
 		return nil, fmt.Errorf("get master source info: %w", err)
 	}
 
-	// create the master source session
 	source := newMasterSession(sf.sessionLogger, sf.client, reply.SourceIndex, reply.Channels, false)
-
 	return source, nil
 }
 
@@ -131,8 +186,7 @@ func (sf *paSessionFinder) enumerateAndAddSessions(sessions *[]Session) error {
 	for _, info := range reply {
 		name, ok := info.Properties["application.process.binary"]
 
-		// try out fallback properties
-		// this is requred for pipewire / pipewire-pulse
+		// try fallback properties for pipewire-pulse
 		if !ok {
 			name, ok = info.Properties["node.name"]
 			if !ok {
@@ -140,18 +194,13 @@ func (sf *paSessionFinder) enumerateAndAddSessions(sessions *[]Session) error {
 				if !ok {
 					sf.logger.Warnw("Failed to get sink input's process name",
 						"sinkInputIndex", info.SinkInputIndex)
-
 					continue
 				}
 			}
 		}
 
-		// create the deej session object
 		newSession := newPASession(sf.sessionLogger, sf.client, info.SinkInputIndex, info.Channels, name.String())
-
-		// add it to our slice
 		*sessions = append(*sessions, newSession)
-
 	}
 
 	return nil

@@ -9,7 +9,7 @@ import (
 	"runtime/debug"
 	"time"
 
-	"github.com/omriharel/deej/pkg/deej/util"
+	"github.com/Random-Cow/deej-esphome/pkg/deej/util"
 )
 
 const (
@@ -20,7 +20,7 @@ const (
                         deej crashlog
 -----------------------------------------------------------------
 Unfortunately, deej has crashed. This really shouldn't happen!
-If you've just encountered this, please contact @omriharel and attach this error log.
+If you've just encountered this, please contact the maintainer and attach this error log.
 You can also join the deej Discord server at https://discord.gg/nf88NJu.
 -----------------------------------------------------------------
 Time: %s

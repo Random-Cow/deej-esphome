@@ -1,0 +1,24 @@
+[Unit]
+Description=deej volume mixer
+Documentation=https://github.com/Random-Cow/deej-esphome
+# Start after PipeWire and pipewire-pulse are up, since deej talks to them.
+After=pipewire.service pipewire-pulse.service graphical-session.target
+Wants=pipewire.service pipewire-pulse.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/deej
+Restart=on-failure
+RestartSec=5
+
+# Keep logs clean — deej writes to stderr when not in release mode.
+# Use journalctl --user -u deej -f to follow logs.
+StandardOutput=journal
+StandardError=journal
+
+# For running without a tray icon (e.g. a minimal WM or headless session):
+# Environment=DEEJ_NO_TRAY_ICON=1
+
+[Install]
+WantedBy=graphical-session.target

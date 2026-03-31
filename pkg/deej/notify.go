@@ -7,8 +7,8 @@ import (
 	"github.com/gen2brain/beeep"
 	"go.uber.org/zap"
 
-	"github.com/omriharel/deej/pkg/deej/icon"
-	"github.com/omriharel/deej/pkg/deej/util"
+	"github.com/Random-Cow/deej-esphome/pkg/deej/icon"
+	"github.com/Random-Cow/deej-esphome/pkg/deej/util"
 )
 
 // Notifier provides generic notification sending
@@ -16,48 +16,54 @@ type Notifier interface {
 	Notify(title string, message string)
 }
 
-// ToastNotifier provides toast notifications for Windows
+// ToastNotifier sends desktop notifications via beeep (libnotify on Linux).
 type ToastNotifier struct {
-	logger *zap.SugaredLogger
+	logger      *zap.SugaredLogger
+	appIconPath string
 }
 
-// NewToastNotifier creates a new ToastNotifier
+// NewToastNotifier creates a new ToastNotifier and writes the PNG icon to a temp file once.
 func NewToastNotifier(logger *zap.SugaredLogger) (*ToastNotifier, error) {
 	logger = logger.Named("notifier")
-	tn := &ToastNotifier{logger: logger}
 
-	logger.Debug("Created toast notifier instance")
+	appIconPath := filepath.Join(os.TempDir(), "deej.png")
+
+	if !util.FileExists(appIconPath) {
+		logger.Debugw("Writing notification icon to temp file", "path", appIconPath)
+
+		iconData := icon.DeejLogoPNG
+		if len(iconData) == 0 {
+			iconData = icon.DeejLogo
+		}
+
+		f, err := os.Create(appIconPath)
+		if err != nil {
+			logger.Warnw("Failed to create notification icon file", "error", err)
+			appIconPath = ""
+		} else {
+			if _, err = f.Write(iconData); err != nil {
+				logger.Warnw("Failed to write notification icon", "error", err)
+				appIconPath = ""
+			}
+			f.Close()
+		}
+	}
+
+	tn := &ToastNotifier{
+		logger:      logger,
+		appIconPath: appIconPath,
+	}
+
+	logger.Debug("Created notifier instance")
 
 	return tn, nil
 }
 
-// Notify sends a toast notification (or falls back to other types of notification for older Windows versions)
+// Notify sends a desktop notification using beeep (libnotify on Linux).
 func (tn *ToastNotifier) Notify(title string, message string) {
+	tn.logger.Infow("Sending desktop notification", "title", title, "message", message)
 
-	// we need to unpack deej.ico somewhere to remain portable. we already have it as bytes so it should be fine
-	appIconPath := filepath.Join(os.TempDir(), "deej.ico")
-
-	if !util.FileExists(appIconPath) {
-		tn.logger.Debugw("Deej icon file missing, creating", "path", appIconPath)
-
-		f, err := os.Create(appIconPath)
-		if err != nil {
-			tn.logger.Errorw("Failed to create toast notification icon", "error", err)
-		}
-
-		if _, err = f.Write(icon.DeejLogo); err != nil {
-			tn.logger.Errorw("Failed to write toast notification icon", "error", err)
-		}
-
-		if err = f.Close(); err != nil {
-			tn.logger.Errorw("Failed to close toast notification icon", "error", err)
-		}
-	}
-
-	tn.logger.Infow("Sending toast notification", "title", title, "message", message)
-
-	// send the actual notification
-	if err := beeep.Notify(title, message, appIconPath); err != nil {
-		tn.logger.Errorw("Failed to send toast notification", "error", err)
+	if err := beeep.Notify(title, message, tn.appIconPath); err != nil {
+		tn.logger.Errorw("Failed to send desktop notification", "error", err)
 	}
 }

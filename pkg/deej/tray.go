@@ -1,22 +1,23 @@
 package deej
 
 import (
+	"fmt"
+	"time"
+
 	"fyne.io/systray"
 
-	"github.com/omriharel/deej/pkg/deej/icon"
-	"github.com/omriharel/deej/pkg/deej/util"
+	"github.com/Random-Cow/deej-esphome/pkg/deej/icon"
+	"github.com/Random-Cow/deej-esphome/pkg/deej/util"
 )
 
-// loadTrayIcon chooses PNG (Linux) if embedded, else falls back to ICO bytes
+const trayStatusRefreshInterval = 3 * time.Second
+
+// loadTrayIcon returns the embedded PNG icon bytes for Linux.
 func loadTrayIcon() []byte {
-	if util.Linux() && len(icon.DeejLogoPNG) > 0 {
+	if len(icon.DeejLogoPNG) > 0 {
 		return icon.DeejLogoPNG
 	}
-	// Original ICO (works on Windows)
-	if len(icon.DeejLogo) > 0 {
-		return icon.DeejLogo
-	}
-	return nil
+	return icon.DeejLogo
 }
 
 func (d *Deej) initializeTray(onDone func()) {
@@ -25,25 +26,30 @@ func (d *Deej) initializeTray(onDone func()) {
 	onReady := func() {
 		logger.Debug("Tray instance ready")
 
-		// Load embedded icon (PNG preferred on Linux) with fallback
 		iconData := loadTrayIcon()
-		if len(iconData) == 0 {
-			logger.Warn("Embedded icon data empty, falling back to ICO bytes")
-			iconData = icon.DeejLogo
-		}
 		if len(iconData) == 0 {
 			logger.Error("No valid icon data available; tray icon may not display")
 		} else {
 			systray.SetIcon(iconData)
 		}
 		systray.SetTitle("deej")
-		systray.SetTooltip("deej")
+		systray.SetTooltip("deej — volume mixer")
 
-		editConfig := systray.AddMenuItem("Edit configuration", "Open config file with notepad")
-		// Skip setting icon for menu items for now to avoid format issues
+		// ── Status section (disabled items used as read-only labels) ──────────
+		connStatusItem := systray.AddMenuItem("ESPHome: connecting…", "ESPHome SSE connection status")
+		connStatusItem.Disable()
 
-		refreshSessions := systray.AddMenuItem("Re-scan audio sessions", "Manually refresh audio sessions if something's stuck")
-		// Skip setting icon for menu items for now to avoid format issues
+		sliderStatusItem := systray.AddMenuItem("Sliders: –", "Current slider positions")
+		sliderStatusItem.Disable()
+
+		sessionStatusItem := systray.AddMenuItem("Sessions: –", "Number of tracked audio sessions")
+		sessionStatusItem.Disable()
+
+		systray.AddSeparator()
+
+		// ── Actions ───────────────────────────────────────────────────────────
+		editConfig := systray.AddMenuItem("Edit configuration", "Open config file")
+		refreshSessions := systray.AddMenuItem("Re-scan audio sessions", "Manually refresh audio sessions")
 
 		if d.version != "" {
 			systray.AddSeparator()
@@ -54,37 +60,34 @@ func (d *Deej) initializeTray(onDone func()) {
 		systray.AddSeparator()
 		quit := systray.AddMenuItem("Quit", "Stop deej and quit")
 
-		// wait on things to happen
+		// ── Periodic status updater ───────────────────────────────────────────
+		go func() {
+			ticker := time.NewTicker(trayStatusRefreshInterval)
+			defer ticker.Stop()
+
+			for range ticker.C {
+				updateTrayStatus(d, connStatusItem, sliderStatusItem, sessionStatusItem)
+			}
+		}()
+
+		// ── Event loop ────────────────────────────────────────────────────────
 		go func() {
 			for {
 				select {
-
-				// quit
 				case <-quit.ClickedCh:
 					logger.Info("Quit menu item clicked, stopping")
-
 					d.signalStop()
 
-				// edit config
 				case <-editConfig.ClickedCh:
 					logger.Info("Edit config menu item clicked, opening config for editing")
-
-					editor := "notepad.exe"
-					if util.Linux() {
-						editor = "gedit"
-					}
-
-					if err := util.OpenExternal(logger, editor, userConfigFilepath); err != nil {
+					if err := util.OpenExternal(logger, "xdg-open", userConfigFilepath); err != nil {
 						logger.Warnw("Failed to open config file for editing", "error", err)
 					}
 
-				// refresh sessions
 				case <-refreshSessions.ClickedCh:
 					logger.Info("Refresh sessions menu item clicked, triggering session map refresh")
-
-					// performance: the reason that forcing a refresh here is okay is that users can't spam the
-					// right-click -> select-this-option sequence at a rate that's meaningful to performance
 					d.sessions.refreshSessions(true)
+					updateTrayStatus(d, connStatusItem, sliderStatusItem, sessionStatusItem)
 				}
 			}
 		}()
@@ -97,9 +100,67 @@ func (d *Deej) initializeTray(onDone func()) {
 		logger.Debug("Tray exited")
 	}
 
-	// start the tray icon
 	logger.Debug("Running in tray")
 	systray.Run(onReady, onExit)
+}
+
+// updateTrayStatus refreshes the disabled status menu items with current data.
+func updateTrayStatus(d *Deej, connItem, sliderItem, sessionItem *systray.MenuItem) {
+	status := d.GetESPHomeStatus()
+
+	// Connection status line
+	if status.Connected {
+		uptime := time.Since(status.ConnectedSince).Round(time.Second)
+		connLine := fmt.Sprintf("ESPHome %s ✓ (up %s)", status.IPAddress, uptime)
+		if status.ReconnectCount > 0 {
+			connLine += fmt.Sprintf(", %d reconnect(s)", status.ReconnectCount)
+		}
+		connItem.SetTitle(connLine)
+	} else {
+		if status.ReconnectCount > 0 {
+			connItem.SetTitle(fmt.Sprintf("ESPHome %s ✗ (reconnecting, attempt %d)", status.IPAddress, status.ReconnectCount+1))
+		} else {
+			connItem.SetTitle(fmt.Sprintf("ESPHome %s ✗ (connecting…)", status.IPAddress))
+		}
+	}
+
+	// Slider values line
+	sliderNames := d.config.ESPHomeSliderNames
+	if len(status.SliderValues) > 0 {
+		parts := make([]string, 0, len(status.SliderValues))
+		for i, v := range status.SliderValues {
+			label := fmt.Sprintf("%d", i)
+			if i < len(sliderNames) {
+				label = sliderNames[i]
+			}
+			if v < 0 {
+				parts = append(parts, fmt.Sprintf("%s:–", label))
+			} else {
+				parts = append(parts, fmt.Sprintf("%s:%d%%", label, int(v*100)))
+			}
+		}
+		sliderItem.SetTitle("Sliders: " + joinStrings(parts, "  "))
+	} else {
+		sliderItem.SetTitle("Sliders: –")
+	}
+
+	// Session count line
+	if d.sessions != nil {
+		count := d.sessions.SessionCount()
+		sessionItem.SetTitle(fmt.Sprintf("Sessions: %d active", count))
+	}
+}
+
+// joinStrings joins a slice of strings with a separator.
+func joinStrings(ss []string, sep string) string {
+	result := ""
+	for i, s := range ss {
+		if i > 0 {
+			result += sep
+		}
+		result += s
+	}
+	return result
 }
 
 func (d *Deej) stopTray() {

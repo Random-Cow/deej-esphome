@@ -2,12 +2,12 @@ package deej
 
 import (
 	"fmt"
+	"path"
 	"regexp"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/omriharel/deej/pkg/deej/util"
 	"github.com/thoas/go-funk"
 	"go.uber.org/zap"
 )
@@ -23,6 +23,10 @@ type sessionMap struct {
 
 	lastSessionRefresh time.Time
 	unmappedSessions   []Session
+
+	// lastApplyTime tracks when we last called applyCurrentSliderVolumes.
+	// Used to debounce SINK_INPUT_CHANGE events caused by our own SetVolume calls.
+	lastApplyTime time.Time
 }
 
 const (
@@ -33,9 +37,6 @@ const (
 	// some targets need to be transformed before their correct audio sessions can be accessed.
 	// this prefix identifies those targets to ensure they don't contradict with another similarly-named process
 	specialTargetTransformPrefix = "deej."
-
-	// targets the currently active window (Windows-only, experimental)
-	specialTargetCurrentWindow = "current"
 
 	// targets all currently unmapped sessions (experimental)
 	specialTargetAllUnmapped = "unmapped"
@@ -52,9 +53,18 @@ const (
 	// to manually refresh sessions). a cleaner way to do this down the line is by registering to notifications
 	// whenever a new session is added, but that's too hard to justify for how easy this solution is
 	maxTimeBetweenSessionRefreshes = time.Second * 45
+
+	// how long after our own SetVolume call we ignore incoming CHANGE events.
+	// This breaks the feedback loop: our SetVolume causes a CHANGE event within ~5ms;
+	// external overrides (Firefox, WirePlumber) typically arrive well after this window.
+	changeEventDebounce = 150 * time.Millisecond
+
+	// backoff values for PA reconnection attempts
+	paReconnectBaseDelay = time.Second
+	paReconnectMaxDelay  = 30 * time.Second
 )
 
-// this matches friendly device names (on Windows), e.g. "Headphones (Realtek Audio)"
+// this matches friendly device names, e.g. "Headphones (Realtek Audio)"
 var deviceSessionKeyPattern = regexp.MustCompile(`^.+ \(.+\)$`)
 
 func newSessionMap(deej *Deej, logger *zap.SugaredLogger, sessionFinder SessionFinder) (*sessionMap, error) {
@@ -81,6 +91,8 @@ func (m *sessionMap) initialize() error {
 
 	m.setupOnConfigReload()
 	m.setupOnSliderMove()
+	m.setupOnNewSession()
+	m.setupOnSessionChange()
 
 	return nil
 }
@@ -149,6 +161,91 @@ func (m *sessionMap) setupOnSliderMove() {
 	}()
 }
 
+func (m *sessionMap) setupOnNewSession() {
+	newSessionCh := m.sessionFinder.SubscribeToNewSessions()
+
+	go func() {
+		for range newSessionCh {
+			m.logger.Debug("New audio session detected via PulseAudio event, refreshing and applying volumes")
+			m.refreshSessions(true)
+			m.ApplyCurrentSliderVolumes()
+
+			// Some apps (Firefox, Spotify, WirePlumber) set or restore their own
+			// stream volume asynchronously after stream creation. Re-apply our
+			// desired volumes at increasing delays to ensure we win the race.
+			for _, delay := range []time.Duration{100 * time.Millisecond, 300 * time.Millisecond, 600 * time.Millisecond, 1000 * time.Millisecond} {
+				go func(d time.Duration) {
+					time.Sleep(d)
+					m.ApplyCurrentSliderVolumes()
+				}(delay)
+			}
+		}
+	}()
+}
+
+// setupOnSessionChange listens for SINK_INPUT_CHANGE events and re-applies
+// slider volumes whenever an external source (Firefox, Spotify, WirePlumber)
+// overrides a volume that deej previously set.
+func (m *sessionMap) setupOnSessionChange() {
+	changedCh := m.sessionFinder.SubscribeToSessionChanges()
+
+	go func() {
+		for range changedCh {
+			// Debounce: ignore CHANGE events that arrive shortly after our own
+			// SetVolume calls (those changes are caused by us, not external software).
+			if time.Since(m.lastApplyTime) < changeEventDebounce {
+				continue
+			}
+
+			m.logger.Debug("External volume change detected, re-applying slider volumes")
+			m.ApplyCurrentSliderVolumes()
+		}
+	}()
+}
+
+// applyCurrentSliderVolumes sets the volume of every mapped session to the
+// current slider position. It is called immediately after a new audio session
+// appears and whenever an external volume change is detected, to ensure deej
+// always wins against app-initiated or WirePlumber-initiated overrides.
+func (m *sessionMap) ApplyCurrentSliderVolumes() {
+	currentValues := m.deej.sliderEventSource.GetCurrentSliderValues()
+	if len(currentValues) == 0 {
+		return
+	}
+
+	// Record the time so CHANGE events caused by our own SetVolume calls can be
+	// identified and ignored by setupOnSessionChange (debounce).
+	m.lastApplyTime = time.Now()
+
+	m.deej.config.SliderMapping.iterate(func(sliderIdx int, targets []string) {
+		if sliderIdx >= len(currentValues) {
+			return
+		}
+
+		volume := currentValues[sliderIdx]
+
+		// Skip sentinel value (-1.0): ESPHome hasn't delivered a real value yet.
+		if volume < 0 {
+			return
+		}
+
+		for _, target := range targets {
+			resolvedTargets := m.resolveTarget(target)
+			for _, resolvedTarget := range resolvedTargets {
+				sessions, ok := m.getMatching(resolvedTarget)
+				if !ok {
+					continue
+				}
+				for _, session := range sessions {
+					if err := session.SetVolume(volume); err != nil {
+						m.logger.Warnw("Failed to apply current volume to session", "error", err)
+					}
+				}
+			}
+		}
+	})
+}
+
 // performance: explain why force == true at every such use to avoid unintended forced refresh spams
 func (m *sessionMap) refreshSessions(force bool) {
 
@@ -162,8 +259,54 @@ func (m *sessionMap) refreshSessions(force bool) {
 
 	if err := m.getAndAddSessions(); err != nil {
 		m.logger.Warnw("Failed to re-acquire all audio sessions", "error", err)
+		// Trigger a background reconnect attempt; the next slider event or
+		// periodic check will succeed once PipeWire is back.
+		go m.reconnectSessionFinder()
 	} else {
 		m.logger.Debug("Re-acquired sessions successfully")
+	}
+}
+
+// reconnectSessionFinder releases the current (broken) PA connection and
+// re-establishes it with exponential backoff. Called when GetAllSessions fails,
+// typically after PipeWire restarts.
+func (m *sessionMap) reconnectSessionFinder() {
+	m.logger.Info("Attempting to reconnect to PipeWire/PulseAudio")
+
+	// Release the broken connection (ignore error — it's already dead).
+	m.sessionFinder.Release() //nolint:errcheck
+
+	backoff := paReconnectBaseDelay
+
+	for {
+		time.Sleep(backoff)
+
+		newFinder, err := newSessionFinder(m.deej.logger)
+		if err != nil {
+			m.logger.Warnw("PA reconnect attempt failed, retrying", "error", err, "backoff", backoff)
+			backoff *= 2
+			if backoff > paReconnectMaxDelay {
+				backoff = paReconnectMaxDelay
+			}
+			continue
+		}
+
+		m.logger.Info("Reconnected to PipeWire/PulseAudio successfully")
+		m.sessionFinder = newFinder
+
+		// Re-subscribe internal goroutines to the new finder's channels.
+		m.setupOnNewSession()
+		m.setupOnSessionChange()
+
+		// Repopulate sessions with the new connection.
+		m.clear()
+		if err := m.getAndAddSessions(); err != nil {
+			m.logger.Warnw("Failed to get sessions after PA reconnect", "error", err)
+		} else {
+			m.ApplyCurrentSliderVolumes()
+		}
+
+		return
 	}
 }
 
@@ -200,6 +343,14 @@ func (m *sessionMap) sessionMapped(session Session) bool {
 				matchFound = true
 				return
 			}
+
+			// Also support glob patterns (e.g. "firefox*" matches "firefox", "Web Content", etc.)
+			if isGlobPattern(target) {
+				if matched, _ := path.Match(target, session.Key()); matched {
+					matchFound = true
+					return
+				}
+			}
 		}
 	})
 
@@ -235,8 +386,8 @@ func (m *sessionMap) handleSliderMoveEvent(event SliderMoveEvent) {
 		// for each resolved target...
 		for _, resolvedTarget := range resolvedTargets {
 
-			// check the map for matching sessions
-			sessions, ok := m.get(resolvedTarget)
+			// check the map for matching sessions (supports glob patterns)
+			sessions, ok := m.getMatching(resolvedTarget)
 
 			// no sessions matching this target - move on
 			if !ok {
@@ -248,6 +399,9 @@ func (m *sessionMap) handleSliderMoveEvent(event SliderMoveEvent) {
 			// iterate all matching sessions and adjust the volume of each one
 			for _, session := range sessions {
 				if session.GetVolume() != event.PercentValue {
+					// Record apply time before SetVolume so the resulting
+					// SINK_INPUT_CHANGE event is treated as our own and ignored.
+					m.lastApplyTime = time.Now()
 					if err := session.SetVolume(event.PercentValue); err != nil {
 						m.logger.Warnw("Failed to set target session volume", "error", err)
 						adjustmentFailed = true
@@ -293,23 +447,6 @@ func (m *sessionMap) applyTargetTransform(specialTargetName string) []string {
 	// select the transformation based on its name
 	switch specialTargetName {
 
-	// get current active window
-	case specialTargetCurrentWindow:
-		currentWindowProcessNames, err := util.GetCurrentWindowProcessNames()
-
-		// silently ignore errors here, as this is on deej's "hot path" (and it could just mean the user's running linux)
-		if err != nil {
-			return nil
-		}
-
-		// we could have gotten a non-lowercase names from that, so let's ensure we return ones that are lowercase
-		for targetIdx, target := range currentWindowProcessNames {
-			currentWindowProcessNames[targetIdx] = strings.ToLower(target)
-		}
-
-		// remove dupes
-		return funk.UniqString(currentWindowProcessNames)
-
 	// get currently unmapped sessions
 	case specialTargetAllUnmapped:
 		targetKeys := make([]string, len(m.unmappedSessions))
@@ -345,6 +482,31 @@ func (m *sessionMap) get(key string) ([]Session, bool) {
 	return value, ok
 }
 
+// getMatching returns all sessions whose key exactly matches the target, or
+// if the target is a glob pattern, all sessions whose key matches the pattern.
+func (m *sessionMap) getMatching(target string) ([]Session, bool) {
+	if !isGlobPattern(target) {
+		return m.get(target)
+	}
+
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	var result []Session
+	for key, sessions := range m.m {
+		if matched, _ := path.Match(target, key); matched {
+			result = append(result, sessions...)
+		}
+	}
+
+	return result, len(result) > 0
+}
+
+// isGlobPattern returns true if s contains any glob metacharacters.
+func isGlobPattern(s string) bool {
+	return strings.ContainsAny(s, "*?[")
+}
+
 func (m *sessionMap) clear() {
 	m.lock.Lock()
 	defer m.lock.Unlock()
@@ -373,4 +535,16 @@ func (m *sessionMap) String() string {
 	}
 
 	return fmt.Sprintf("<%d audio sessions>", sessionCount)
+}
+
+// SessionCount returns the total number of currently tracked audio sessions.
+func (m *sessionMap) SessionCount() int {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	count := 0
+	for _, sessions := range m.m {
+		count += len(sessions)
+	}
+	return count
 }

@@ -1,257 +1,336 @@
 package deej
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
 
-	"github.com/omriharel/deej/pkg/deej/util"
+	"github.com/Random-Cow/deej-esphome/pkg/deej/util"
 )
 
-// ESPHome provides a deej-aware abstraction layer to managing ESPHome I/O
+const (
+	sseReconnectBaseDelay = time.Second
+	sseReconnectMaxDelay  = time.Minute
+)
+
+// ESPHome manages the connection to an ESPHome device over HTTP/SSE.
 type ESPHome struct {
 	deej   *Deej
 	logger *zap.SugaredLogger
 
-	stopChannel chan bool
-	connected   bool
+	stopChannel    chan bool
+	connected      bool
+	connectedSince time.Time
+	reconnectCount int
 
-	lastKnownNumSliders        int
 	currentSliderPercentValues []float32
-
-	lastGoodResults []int
+	lock                       sync.Mutex
 
 	sliderMoveConsumers []chan SliderMoveEvent
 }
 
-// ESPHome sensor data
-type SensorData struct {
-	Id    string `json:"id"`
-	State string `json:"state"`
-	Value int    `json:"value"`
+// ESPHomeStatus holds a snapshot of the current ESPHome connection state.
+type ESPHomeStatus struct {
+	Connected      bool
+	IPAddress      string
+	ConnectedSince time.Time
+	ReconnectCount int
+	SliderValues   []float32
 }
 
-// NewESPHome creates a ESPHome instance that uses the provided deej
-// instance's connection info to establish communications with the ESPHome device
+// sensorData represents an ESPHome sensor event from the SSE stream.
+type sensorData struct {
+	Id    string  `json:"id"`
+	Name  string  `json:"name"`
+	State string  `json:"state"`
+	Value float64 `json:"value"`
+}
+
+// NewESPHome creates an ESPHome instance using the provided deej config.
 func NewESPHome(deej *Deej, logger *zap.SugaredLogger) (*ESPHome, error) {
 	logger = logger.Named("esphome")
 
-	esphome := &ESPHome{
-		deej:                deej,
-		logger:              logger,
-		stopChannel:         make(chan bool),
-		connected:           false,
-		sliderMoveConsumers: []chan SliderMoveEvent{},
+	numSliders := len(deej.config.ESPHomeSliderNames)
+	currentValues := make([]float32, numSliders)
+	for i := range currentValues {
+		currentValues[i] = -1.0 // sentinel: force emission on first real value
 	}
 
-	logger.Debug("Created ESPHome instance")
+	esphome := &ESPHome{
+		deej:                       deej,
+		logger:                     logger,
+		stopChannel:                make(chan bool),
+		currentSliderPercentValues: currentValues,
+		sliderMoveConsumers:        []chan SliderMoveEvent{},
+	}
 
-	// respond to config changes
 	esphome.setupOnConfigReload()
+
+	logger.Debug("Created ESPHome instance")
 
 	return esphome, nil
 }
 
-// Start attempts to connect to our arduino chip
+// Start fetches initial sensor values and begins the SSE stream loop.
 func (esphome *ESPHome) Start() error {
-
-	// don't allow multiple concurrent connections
 	if esphome.connected {
 		esphome.logger.Warn("Already connected, can't start another without closing first")
 		return errors.New("ESPHome: connection already active")
 	}
 
-	namedLogger := esphome.logger.Named(strings.ToLower(esphome.deej.config.ESPHomeIpAddr))
+	// Fetch current values once so sliders have a known state before SSE events arrive.
+	esphome.fetchInitialState()
 
-	// read lines or await a stop
-	go func() {
-		lineChannel := esphome.readLine(namedLogger)
-
-		for {
-			select {
-			case <-esphome.stopChannel:
-				esphome.close(namedLogger)
-			case line := <-lineChannel:
-				esphome.handleLine(namedLogger, line)
-			}
-		}
-	}()
+	go esphome.sseLoop()
 
 	return nil
 }
 
-// Stop signals us to shut down our serial connection, if one is active
+// Stop signals the ESPHome goroutine to shut down.
 func (esphome *ESPHome) Stop() {
 	esphome.stopChannel <- true
 }
 
-// SubscribeToSliderMoveEvents returns an unbuffered channel that receives
-// a sliderMoveEvent struct every time a slider moves
+// SubscribeToSliderMoveEvents returns a channel that receives a SliderMoveEvent
+// every time a slider changes value beyond the noise-reduction threshold.
 func (esphome *ESPHome) SubscribeToSliderMoveEvents() chan SliderMoveEvent {
 	ch := make(chan SliderMoveEvent)
 	esphome.sliderMoveConsumers = append(esphome.sliderMoveConsumers, ch)
-
 	return ch
+}
+
+// GetCurrentSliderValues returns a snapshot of the last-known normalised slider values.
+func (esphome *ESPHome) GetCurrentSliderValues() []float32 {
+	esphome.lock.Lock()
+	defer esphome.lock.Unlock()
+
+	result := make([]float32, len(esphome.currentSliderPercentValues))
+	copy(result, esphome.currentSliderPercentValues)
+	return result
+}
+
+// GetStatus returns a snapshot of the current ESPHome connection state for display.
+func (esphome *ESPHome) GetStatus() ESPHomeStatus {
+	esphome.lock.Lock()
+	defer esphome.lock.Unlock()
+
+	values := make([]float32, len(esphome.currentSliderPercentValues))
+	copy(values, esphome.currentSliderPercentValues)
+
+	return ESPHomeStatus{
+		Connected:      esphome.connected,
+		IPAddress:      esphome.deej.config.ESPHomeIpAddr,
+		ConnectedSince: esphome.connectedSince,
+		ReconnectCount: esphome.reconnectCount,
+		SliderValues:   values,
+	}
 }
 
 func (esphome *ESPHome) setupOnConfigReload() {
 	configReloadedChannel := esphome.deej.config.SubscribeToChanges()
 
-	const stopDelay = 50 * time.Millisecond
-
 	go func() {
-		for {
-			select {
-			case <-configReloadedChannel:
-
-				// make any config reload unset our slider number to ensure process volumes are being re-set
-				// (the next read line will emit SliderMoveEvent instances for all sliders)\
-				// this needs to happen after a small delay, because the session map will also re-acquire sessions
-				// whenever the config file is reloaded, and we don't want it to receive these move events while the map
-				// is still cleared. this is kind of ugly, but shouldn't cause any issues
-				go func() {
-					<-time.After(stopDelay)
-					esphome.lastKnownNumSliders = 0
-				}()
+		for range configReloadedChannel {
+			// Reset values so slider move events are re-emitted after reload,
+			// ensuring the session map receives fresh volume commands.
+			esphome.lock.Lock()
+			for i := range esphome.currentSliderPercentValues {
+				esphome.currentSliderPercentValues[i] = -1.0
 			}
+			esphome.lock.Unlock()
 		}
 	}()
 }
 
-func (esphome *ESPHome) close(logger *zap.SugaredLogger) {
-	logger.Debug("ESPHome connection closed")
-	esphome.connected = false
-}
+// fetchInitialState does a one-time HTTP GET for each configured sensor so
+// we have values before the SSE stream delivers its first events.
+func (esphome *ESPHome) fetchInitialState() {
+	logger := esphome.logger.Named(esphome.deej.config.ESPHomeIpAddr)
 
-func (esphome *ESPHome) getLine(logger *zap.SugaredLogger) ([]int, error) {
-	results := make([]int, len(esphome.deej.config.ESPHomeSliderNames))
+	for idx, entityID := range esphome.deej.config.ESPHomeSliderNames {
+		url := fmt.Sprintf("http://%s/sensor/%s", esphome.deej.config.ESPHomeIpAddr, entityID)
 
-	for index, sensorEntityID := range esphome.deej.config.ESPHomeSliderNames {
-		// Construct the URL to fetch sensor data
-		url := fmt.Sprintf("http://%s/sensor/%s", esphome.deej.config.ESPHomeIpAddr, sensorEntityID)
-
-		// Send HTTP GET request to ESPHome device
-		response, err := http.Get(url)
+		resp, err := http.Get(url)
 		if err != nil {
-			logger.Warnw("Error fetching data:", "error", err)
-			return nil, err
-		}
-		defer response.Body.Close()
-
-		// Read response body
-		body, err := io.ReadAll(response.Body)
-		if err != nil {
-			logger.Warnw("Error reading response body:", "error", err)
-			return nil, err
+			logger.Warnw("Failed to fetch initial sensor state", "sensor", entityID, "error", err)
+			continue
 		}
 
-		// Parse JSON response into SensorData struct
-		var sensorData SensorData
-		err = json.Unmarshal(body, &sensorData)
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
 		if err != nil {
-			logger.Warnw("Error parsing JSON:", "error", err)
-			return nil, err
+			logger.Warnw("Failed to read sensor response", "sensor", entityID, "error", err)
+			continue
 		}
 
-		results[index] = sensorData.Value
+		var data sensorData
+		if err := json.Unmarshal(body, &data); err != nil {
+			logger.Warnw("Failed to parse sensor response", "sensor", entityID, "error", err)
+			continue
+		}
+
+		esphome.updateSlider(idx, data.Value)
 	}
-	esphome.lastGoodResults = results
-	return results, nil
 }
 
-func (esphome *ESPHome) readLine(logger *zap.SugaredLogger) chan []int {
-	ch := make(chan []int)
+// sseLoop maintains the SSE connection, reconnecting with exponential backoff on failure.
+func (esphome *ESPHome) sseLoop() {
+	logger := esphome.logger.Named(esphome.deej.config.ESPHomeIpAddr)
 
-	go func() {
-		for {
-			results, err := esphome.getLine(logger)
-			if err != nil {
+	backoff := sseReconnectBaseDelay
 
-				if esphome.deej.Verbose() {
-					logger.Warnw("Failed to read results from server", "error", err, "results", results)
-				}
-
-				// just ignore the results and return the last good results
-				ch <- esphome.lastGoodResults
-			}
-
-			if esphome.deej.Verbose() {
-				logger.Debugw("Read new results", "results", results)
-			}
-
-			// deliver the results to the channel
-			ch <- results
-		}
-	}()
-
-	return ch
-}
-
-func (esphome *ESPHome) handleLine(logger *zap.SugaredLogger, results []int) {
-	numSliders := len(results)
-
-	// update our slider count, if needed - this will send slider move events for all
-	if numSliders != esphome.lastKnownNumSliders {
-		logger.Infow("Detected sliders", "amount", numSliders)
-		esphome.lastKnownNumSliders = numSliders
-		esphome.currentSliderPercentValues = make([]float32, numSliders)
-
-		// reset everything to be an impossible value to force the slider move event later
-		for idx := range esphome.currentSliderPercentValues {
-			esphome.currentSliderPercentValues[idx] = -1.0
-		}
-	}
-
-	// for each slider:
-	moveEvents := []SliderMoveEvent{}
-	for sliderIdx, number := range results {
-		// turns out the first line could come out dirty sometimes (i.e. "4558|925|41|643|220")
-		// so let's check the first number for correctness just in case
-		if sliderIdx == 0 && number > 1023 {
-			esphome.logger.Debugw("Got malformed line from serial, ignoring", "results", results)
+	for {
+		select {
+		case <-esphome.stopChannel:
+			esphome.lock.Lock()
+			esphome.connected = false
+			esphome.lock.Unlock()
 			return
+		default:
 		}
 
-		// map the value from raw to a "dirty" float between 0 and 1 (e.g. 0.15451...)
-		dirtyFloat := float32(number) / 1023.0
-
-		// normalize it to an actual volume scalar between 0.0 and 1.0 with 2 points of precision
-		normalizedScalar := util.NormalizeScalar(dirtyFloat)
-
-		// if sliders are inverted, take the complement of 1.0
-		if esphome.deej.config.InvertSliders {
-			normalizedScalar = 1 - normalizedScalar
+		err := esphome.runSSEStream(logger)
+		if err != nil {
+			esphome.lock.Lock()
+			esphome.connected = false
+			esphome.reconnectCount++
+			esphome.lock.Unlock()
+			logger.Warnw("SSE stream ended, reconnecting", "error", err, "backoff", backoff)
 		}
 
-		// check if it changes the desired state (could just be a jumpy raw slider value)
-		if util.SignificantlyDifferent(esphome.currentSliderPercentValues[sliderIdx], normalizedScalar, esphome.deej.config.NoiseReductionLevel) {
+		select {
+		case <-esphome.stopChannel:
+			esphome.lock.Lock()
+			esphome.connected = false
+			esphome.lock.Unlock()
+			return
+		case <-time.After(backoff):
+		}
 
-			// if it does, update the saved value and create a move event
-			esphome.currentSliderPercentValues[sliderIdx] = normalizedScalar
+		// exponential backoff
+		backoff *= 2
+		if backoff > sseReconnectMaxDelay {
+			backoff = sseReconnectMaxDelay
+		}
+	}
+}
 
-			moveEvents = append(moveEvents, SliderMoveEvent{
-				SliderID:     sliderIdx,
-				PercentValue: normalizedScalar,
-			})
+// runSSEStream opens GET /events and processes the Server-Sent Events stream.
+// Returns when the stream ends or an error occurs.
+func (esphome *ESPHome) runSSEStream(logger *zap.SugaredLogger) error {
+	url := fmt.Sprintf("http://%s/events", esphome.deej.config.ESPHomeIpAddr)
 
-			if esphome.deej.Verbose() {
-				logger.Debugw("Slider moved", "event", moveEvents[len(moveEvents)-1])
+	resp, err := http.Get(url)
+	if err != nil {
+		return fmt.Errorf("connect to SSE: %w", err)
+	}
+	defer resp.Body.Close()
+
+	esphome.lock.Lock()
+	esphome.connected = true
+	esphome.connectedSince = time.Now()
+	esphome.lock.Unlock()
+
+	logger.Infow("Connected to ESPHome SSE stream")
+
+	scanner := bufio.NewScanner(resp.Body)
+	var eventType string
+
+	for scanner.Scan() {
+		select {
+		case <-esphome.stopChannel:
+			esphome.stopChannel <- true // put it back for sseLoop to read
+			return nil
+		default:
+		}
+
+		line := scanner.Text()
+
+		switch {
+		case strings.HasPrefix(line, "event: "):
+			eventType = strings.TrimPrefix(line, "event: ")
+
+		case strings.HasPrefix(line, "data: ") && eventType == "state":
+			dataStr := strings.TrimPrefix(line, "data: ")
+			var data sensorData
+			if err := json.Unmarshal([]byte(dataStr), &data); err != nil {
+				logger.Warnw("Failed to parse SSE data", "data", dataStr, "error", err)
+				eventType = ""
+				continue
 			}
+			if idx := esphome.findSliderIndex(data.Id); idx >= 0 {
+				esphome.updateSlider(idx, data.Value)
+			}
+			eventType = ""
+
+		case line == "":
+			eventType = ""
 		}
 	}
 
-	// deliver move events if there are any, towards all potential consumers
-	if len(moveEvents) > 0 {
-		for _, consumer := range esphome.sliderMoveConsumers {
-			for _, moveEvent := range moveEvents {
-				consumer <- moveEvent
-			}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("SSE stream read error: %w", err)
+	}
+
+	return fmt.Errorf("SSE stream closed by server")
+}
+
+// findSliderIndex maps an SSE entity ID (e.g. "sensor-input_0") to a slider index.
+func (esphome *ESPHome) findSliderIndex(sseID string) int {
+	for i, name := range esphome.deej.config.ESPHomeSliderNames {
+		if sseID == "sensor-"+name {
+			return i
 		}
+	}
+	return -1
+}
+
+// updateSlider converts a raw sensor value to a normalised volume scalar,
+// applies noise reduction, and emits a SliderMoveEvent if the value changed.
+func (esphome *ESPHome) updateSlider(idx int, rawValue float64) {
+	// ESPHome ADC sensors report 0–1023
+	dirtyFloat := float32(rawValue) / 1023.0
+	normalizedScalar := util.NormalizeScalar(dirtyFloat)
+
+	if esphome.deej.config.InvertSliders {
+		normalizedScalar = 1 - normalizedScalar
+	}
+
+	esphome.lock.Lock()
+	if idx < 0 || idx >= len(esphome.currentSliderPercentValues) {
+		esphome.lock.Unlock()
+		return
+	}
+
+	prev := esphome.currentSliderPercentValues[idx]
+	shouldEmit := util.SignificantlyDifferent(prev, normalizedScalar, esphome.deej.config.NoiseReductionLevel)
+	if shouldEmit {
+		esphome.currentSliderPercentValues[idx] = normalizedScalar
+	}
+	esphome.lock.Unlock()
+
+	if !shouldEmit {
+		return
+	}
+
+	event := SliderMoveEvent{
+		SliderID:     idx,
+		PercentValue: normalizedScalar,
+	}
+
+	if esphome.deej.Verbose() {
+		esphome.logger.Debugw("Slider moved", "event", event)
+	}
+
+	for _, consumer := range esphome.sliderMoveConsumers {
+		consumer <- event
 	}
 }

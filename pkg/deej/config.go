@@ -12,7 +12,7 @@ import (
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
 
-	"github.com/omriharel/deej/pkg/deej/util"
+	"github.com/Random-Cow/deej-esphome/pkg/deej/util"
 )
 
 // CanonicalConfig provides application-wide access to configuration fields,
@@ -20,14 +20,8 @@ import (
 type CanonicalConfig struct {
 	SliderMapping *sliderMap
 
-	ConnectionInfo struct {
-		COMPort  string
-		BaudRate int
-	}
-
 	InvertSliders bool
 
-	UseESPHome         bool
 	ESPHomeIpAddr      string
 	ESPHomeSliderNames []string
 
@@ -53,15 +47,9 @@ const (
 
 	configKeySliderMapping       = "slider_mapping"
 	configKeyInvertSliders       = "invert_sliders"
-	configKeyCOMPort             = "com_port"
-	configKeyBaudRate            = "baud_rate"
 	configKeyNoiseReductionLevel = "noise_reduction"
-	configKeyUseESPHome          = "use_esphome"
 	configKeyESPHomeMapping      = "esphome_mapping"
 	configKeyESPHomeIp           = "esphome_ip"
-
-	defaultCOMPort  = "COM4"
-	defaultBaudRate = 9600
 )
 
 // userConfigFilepath and userConfigPath become vars to allow Linux specific override (~/.config/deej)
@@ -113,8 +101,6 @@ func NewConfig(logger *zap.SugaredLogger, notifier Notifier) (*CanonicalConfig, 
 
 	userConfig.SetDefault(configKeySliderMapping, map[string][]string{})
 	userConfig.SetDefault(configKeyInvertSliders, false)
-	userConfig.SetDefault(configKeyCOMPort, defaultCOMPort)
-	userConfig.SetDefault(configKeyBaudRate, defaultBaudRate)
 
 	internalConfig := viper.New()
 	internalConfig.SetConfigName(internalConfigName)
@@ -136,14 +122,8 @@ func (cc *CanonicalConfig) Load() error {
 	// make sure it exists
 	if !util.FileExists(userConfigFilepath) {
 		cc.logger.Warnw("Config file not found", "path", userConfigFilepath)
-		missingMsg := fmt.Sprintf("Expected configuration at %s", userConfigFilepath)
-		if util.Linux() {
-			missingMsg += " (create it to configure deej)"
-		} else {
-			missingMsg += " (must be alongside the deej executable)"
-		}
-		cc.notifier.Notify("Can't find configuration!", missingMsg)
-
+		cc.notifier.Notify("Can't find configuration!",
+			fmt.Sprintf("Expected configuration at %s (create it to configure deej)", userConfigFilepath))
 		return fmt.Errorf("config file doesn't exist: %s", userConfigFilepath)
 	}
 
@@ -176,9 +156,8 @@ func (cc *CanonicalConfig) Load() error {
 	cc.logger.Info("Loaded config successfully")
 	cc.logger.Infow("Config values",
 		"sliderMapping", cc.SliderMapping,
-		"connectionInfo", cc.ConnectionInfo,
 		"invertSliders", cc.InvertSliders,
-		"useESPHome", cc.UseESPHome,
+		"esphomeIP", cc.ESPHomeIpAddr,
 		"esphomeMapping", cc.ESPHomeSliderNames)
 
 	return nil
@@ -256,21 +235,7 @@ func (cc *CanonicalConfig) populateFromVipers() error {
 		cc.internalConfig.GetStringMapStringSlice(configKeySliderMapping),
 	)
 
-	// get the rest of the config fields - viper saves us a lot of effort here
-	cc.ConnectionInfo.COMPort = cc.userConfig.GetString(configKeyCOMPort)
-
-	cc.ConnectionInfo.BaudRate = cc.userConfig.GetInt(configKeyBaudRate)
-	if cc.ConnectionInfo.BaudRate <= 0 {
-		cc.logger.Warnw("Invalid baud rate specified, using default value",
-			"key", configKeyBaudRate,
-			"invalidValue", cc.ConnectionInfo.BaudRate,
-			"defaultValue", defaultBaudRate)
-
-		cc.ConnectionInfo.BaudRate = defaultBaudRate
-	}
-
 	cc.InvertSliders = cc.userConfig.GetBool(configKeyInvertSliders)
-	cc.UseESPHome = cc.userConfig.GetBool(configKeyUseESPHome)
 	cc.ESPHomeIpAddr = cc.userConfig.GetString(configKeyESPHomeIp)
 	cc.ESPHomeSliderNames = cc.userConfig.GetStringSlice(configKeyESPHomeMapping)
 	cc.NoiseReductionLevel = cc.userConfig.GetString(configKeyNoiseReductionLevel)

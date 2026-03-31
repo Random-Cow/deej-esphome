@@ -1,15 +1,14 @@
-// Package deej provides a machine-side client that pairs with an Arduino
-// chip to form a tactile, physical volume control system/
+// Package deej provides a machine-side client that pairs with an ESPHome
+// device to form a tactile, physical volume control system.
 package deej
 
 import (
-	"errors"
 	"fmt"
 	"os"
 
 	"go.uber.org/zap"
 
-	"github.com/omriharel/deej/pkg/deej/util"
+	"github.com/Random-Cow/deej-esphome/pkg/deej/util"
 )
 
 const (
@@ -22,6 +21,7 @@ type SliderHardwareInterface interface {
 	Start() error
 	Stop()
 	SubscribeToSliderMoveEvents() chan SliderMoveEvent
+	GetCurrentSliderValues() []float32
 }
 
 // Deej is the main entity managing access to all sub-components
@@ -91,21 +91,12 @@ func (d *Deej) Initialize() error {
 	}
 
 	// initialize the slider event source interface
-	if d.config.UseESPHome {
-		esphome, err := NewESPHome(d, d.logger)
-		if err != nil {
-			d.logger.Errorw("Failed to create ESPHome", "error", err)
-			return fmt.Errorf("create new ESPHome: %w", err)
-		}
-		d.sliderEventSource = esphome
-	} else {
-		serial, err := NewSerialIO(d, d.logger)
-		if err != nil {
-			d.logger.Errorw("Failed to create SerialIO", "error", err)
-			return fmt.Errorf("create new SerialIO: %w", err)
-		}
-		d.sliderEventSource = serial
+	esphome, err := NewESPHome(d, d.logger)
+	if err != nil {
+		d.logger.Errorw("Failed to create ESPHome", "error", err)
+		return fmt.Errorf("create new ESPHome: %w", err)
 	}
+	d.sliderEventSource = esphome
 
 	// initialize the session map
 	if err := d.sessions.initialize(); err != nil {
@@ -140,6 +131,15 @@ func (d *Deej) Verbose() bool {
 	return d.verbose
 }
 
+// GetESPHomeStatus returns the current ESPHome connection status.
+// Returns a zero-value ESPHomeStatus if the slider source is not an ESPHome instance.
+func (d *Deej) GetESPHomeStatus() ESPHomeStatus {
+	if e, ok := d.sliderEventSource.(*ESPHome); ok {
+		return e.GetStatus()
+	}
+	return ESPHomeStatus{}
+}
+
 func (d *Deej) setupInterruptHandler() {
 	interruptChannel := util.SetupCloseHandler()
 
@@ -156,32 +156,18 @@ func (d *Deej) run() {
 	// watch the config file for changes
 	go d.config.WatchConfigFileChanges()
 
-	// connect to the arduino for the first time
+	// connect to the ESPHome device; fetchInitialState runs synchronously so
+	// current slider values are available immediately after Start returns.
 	go func() {
 		if err := d.sliderEventSource.Start(); err != nil {
-			d.logger.Warnw("Failed to start first-time slider hardware connection", "error", err)
-
-			// If the port is busy, that's because something else is connected - notify and quit
-			if errors.Is(err, os.ErrPermission) {
-				d.logger.Warnw("Slider hardware port seems busy, notifying user and closing",
-					"comPort", d.config.ConnectionInfo.COMPort)
-
-				d.notifier.Notify(fmt.Sprintf("Can't connect to %s!", d.config.ConnectionInfo.COMPort),
-					"This Slider hardware port is busy, make sure to close any Slider hardware monitor or other deej instance.")
-
-				d.signalStop()
-
-				// also notify if the COM port they gave isn't found, maybe their config is wrong
-			} else if errors.Is(err, os.ErrNotExist) {
-				d.logger.Warnw("Provided COM port seems wrong, notifying user and closing",
-					"comPort", d.config.ConnectionInfo.COMPort)
-
-				d.notifier.Notify(fmt.Sprintf("Can't connect to %s!", d.config.ConnectionInfo.COMPort),
-					"This Slider hardware port doesn't exist, check your configuration and make sure it's set correctly.")
-
-				d.signalStop()
-			}
+			d.logger.Warnw("Failed to start ESPHome connection", "error", err)
+			return
 		}
+
+		// Apply current slider positions to all mapped sessions on startup,
+		// so volumes are correct without needing to move any knob.
+		d.logger.Debug("Applying initial slider volumes after ESPHome connect")
+		d.sessions.ApplyCurrentSliderVolumes()
 	}()
 
 	// wait until stopped (gracefully)
