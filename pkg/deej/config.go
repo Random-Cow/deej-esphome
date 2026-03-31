@@ -2,7 +2,9 @@ package deej
 
 import (
 	"fmt"
+	"os"
 	"path"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -42,13 +44,10 @@ type CanonicalConfig struct {
 }
 
 const (
-	userConfigFilepath     = "config.yaml"
 	internalConfigFilepath = "preferences.yaml"
 
 	userConfigName     = "config"
 	internalConfigName = "preferences"
-
-	userConfigPath = "."
 
 	configType = "yaml"
 
@@ -63,6 +62,12 @@ const (
 
 	defaultCOMPort  = "COM4"
 	defaultBaudRate = 9600
+)
+
+// userConfigFilepath and userConfigPath become vars to allow Linux specific override (~/.config/deej)
+var (
+	userConfigFilepath = "config.yaml" // overridden on Linux
+	userConfigPath     = "."           // directory searched by viper
 )
 
 // has to be defined as a non-constant because we're using path.Join
@@ -84,6 +89,20 @@ func NewConfig(logger *zap.SugaredLogger, notifier Notifier) (*CanonicalConfig, 
 		notifier:           notifier,
 		reloadConsumers:    []chan bool{},
 		stopWatcherChannel: make(chan bool),
+	}
+
+	// On Linux, adopt the XDG base directory (~/.config/deej/config.yaml)
+	if util.Linux() {
+		if home, err := os.UserHomeDir(); err == nil {
+			linuxDir := filepath.Join(home, ".config", "deej")
+			if err := util.EnsureDirExists(linuxDir); err != nil {
+				logger.Warnw("Failed to ensure linux config directory exists", "dir", linuxDir, "error", err)
+			}
+			userConfigPath = linuxDir
+			userConfigFilepath = filepath.Join(linuxDir, "config.yaml")
+		} else {
+			logger.Warnw("Failed to determine user home directory; falling back to current directory", "error", err)
+		}
 	}
 
 	// distinguish between the user-provided config (config.yaml) and the internal config (logs/preferences.yaml)
@@ -117,8 +136,13 @@ func (cc *CanonicalConfig) Load() error {
 	// make sure it exists
 	if !util.FileExists(userConfigFilepath) {
 		cc.logger.Warnw("Config file not found", "path", userConfigFilepath)
-		cc.notifier.Notify("Can't find configuration!",
-			fmt.Sprintf("%s must be in the same directory as deej. Please re-launch", userConfigFilepath))
+		missingMsg := fmt.Sprintf("Expected configuration at %s", userConfigFilepath)
+		if util.Linux() {
+			missingMsg += " (create it to configure deej)"
+		} else {
+			missingMsg += " (must be alongside the deej executable)"
+		}
+		cc.notifier.Notify("Can't find configuration!", missingMsg)
 
 		return fmt.Errorf("config file doesn't exist: %s", userConfigFilepath)
 	}

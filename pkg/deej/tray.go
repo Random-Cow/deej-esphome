@@ -1,32 +1,22 @@
 package deej
 
 import (
-	"io/ioutil"
-	"os"
-	"path/filepath"
-
 	"fyne.io/systray"
 
 	"github.com/omriharel/deej/pkg/deej/icon"
 	"github.com/omriharel/deej/pkg/deej/util"
 )
 
-// loadTrayIcon loads the tray icon from a PNG file, falls back to embedded icon if not found
+// loadTrayIcon chooses PNG (Linux) if embedded, else falls back to ICO bytes
 func loadTrayIcon() []byte {
-	// Try to load logo-512.png from the assets folder relative to the executable
-	exePath, err := os.Executable()
-	if err != nil {
+	if util.Linux() && len(icon.DeejLogoPNG) > 0 {
+		return icon.DeejLogoPNG
+	}
+	// Original ICO (works on Windows)
+	if len(icon.DeejLogo) > 0 {
 		return icon.DeejLogo
 	}
-
-	iconPath := filepath.Join(filepath.Dir(exePath), "assets", "logo-512.png")
-
-	if data, err := ioutil.ReadFile(iconPath); err == nil {
-		return data
-	}
-
-	// Fall back to embedded ICO (will show placeholder but app still works)
-	return icon.DeejLogo
+	return nil
 }
 
 func (d *Deej) initializeTray(onDone func()) {
@@ -35,9 +25,17 @@ func (d *Deej) initializeTray(onDone func()) {
 	onReady := func() {
 		logger.Debug("Tray instance ready")
 
-		// Load PNG icon from file or fall back to embedded icon
+		// Load embedded icon (PNG preferred on Linux) with fallback
 		iconData := loadTrayIcon()
-		systray.SetIcon(iconData)
+		if len(iconData) == 0 {
+			logger.Warn("Embedded icon data empty, falling back to ICO bytes")
+			iconData = icon.DeejLogo
+		}
+		if len(iconData) == 0 {
+			logger.Error("No valid icon data available; tray icon may not display")
+		} else {
+			systray.SetIcon(iconData)
+		}
 		systray.SetTitle("deej")
 		systray.SetTooltip("deej")
 
