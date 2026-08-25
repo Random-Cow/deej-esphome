@@ -156,8 +156,8 @@ func (d *Deej) run() {
 	// watch the config file for changes
 	go d.config.WatchConfigFileChanges()
 
-	// connect to the ESPHome device; fetchInitialState runs synchronously so
-	// current slider values are available immediately after Start returns.
+	// connect to the ESPHome device; Start waits briefly for the SSE stream's
+	// initial state replay so current slider values are available immediately.
 	go func() {
 		if err := d.sliderEventSource.Start(); err != nil {
 			d.logger.Warnw("Failed to start ESPHome connection", "error", err)

@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -19,7 +19,16 @@ import (
 const (
 	sseReconnectBaseDelay = time.Second
 	sseReconnectMaxDelay  = time.Minute
+
+	// how long Start() waits for the SSE stream's initial state replay before
+	// returning, so callers can apply real slider values right after startup.
+	initialSyncTimeout = 2 * time.Second
+	initialSyncPoll    = 50 * time.Millisecond
 )
+
+// non-alphanumeric run matcher used to slugify ESPHome entity names the same
+// way ESPHome derives object IDs from friendly names (e.g. "Input 0" -> "input_0").
+var entityNameSanitizer = regexp.MustCompile(`[^a-z0-9]+`)
 
 // ESPHome manages the connection to an ESPHome device over HTTP/SSE.
 type ESPHome struct {
@@ -47,11 +56,15 @@ type ESPHomeStatus struct {
 }
 
 // sensorData represents an ESPHome sensor event from the SSE stream.
+// NameId is only present on firmware built between ESPHome 2026.1.3 and 2026.8.0;
+// on those versions it carries the new "domain/entity_name" format while Id still
+// carries the legacy "domain-object_id" format, so it takes priority when present.
 type sensorData struct {
-	Id    string  `json:"id"`
-	Name  string  `json:"name"`
-	State string  `json:"state"`
-	Value float64 `json:"value"`
+	Id     string  `json:"id"`
+	NameId string  `json:"name_id"`
+	Name   string  `json:"name"`
+	State  string  `json:"state"`
+	Value  float64 `json:"value"`
 }
 
 // NewESPHome creates an ESPHome instance using the provided deej config.
@@ -79,19 +92,42 @@ func NewESPHome(deej *Deej, logger *zap.SugaredLogger) (*ESPHome, error) {
 	return esphome, nil
 }
 
-// Start fetches initial sensor values and begins the SSE stream loop.
+// Start begins the SSE stream loop and waits briefly for its initial state
+// replay (which ESPHome sends automatically on every /events connection) so
+// callers can apply real slider values right after Start returns. It gives up
+// after initialSyncTimeout if the device is unreachable; the SSE loop keeps
+// retrying in the background regardless.
 func (esphome *ESPHome) Start() error {
 	if esphome.connected {
 		esphome.logger.Warn("Already connected, can't start another without closing first")
 		return errors.New("ESPHome: connection already active")
 	}
 
-	// Fetch current values once so sliders have a known state before SSE events arrive.
-	esphome.fetchInitialState()
-
 	go esphome.sseLoop()
 
+	deadline := time.Now().Add(initialSyncTimeout)
+	for time.Now().Before(deadline) {
+		if esphome.hasReceivedInitialValues() {
+			break
+		}
+		time.Sleep(initialSyncPoll)
+	}
+
 	return nil
+}
+
+// hasReceivedInitialValues reports whether at least one slider has moved past
+// its sentinel value, meaning the SSE stream's initial state replay arrived.
+func (esphome *ESPHome) hasReceivedInitialValues() bool {
+	esphome.lock.Lock()
+	defer esphome.lock.Unlock()
+
+	for _, v := range esphome.currentSliderPercentValues {
+		if v >= 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // Stop signals the ESPHome goroutine to shut down.
@@ -148,37 +184,6 @@ func (esphome *ESPHome) setupOnConfigReload() {
 			esphome.lock.Unlock()
 		}
 	}()
-}
-
-// fetchInitialState does a one-time HTTP GET for each configured sensor so
-// we have values before the SSE stream delivers its first events.
-func (esphome *ESPHome) fetchInitialState() {
-	logger := esphome.logger.Named(esphome.deej.config.ESPHomeIpAddr)
-
-	for idx, entityID := range esphome.deej.config.ESPHomeSliderNames {
-		url := fmt.Sprintf("http://%s/sensor/%s", esphome.deej.config.ESPHomeIpAddr, entityID)
-
-		resp, err := http.Get(url)
-		if err != nil {
-			logger.Warnw("Failed to fetch initial sensor state", "sensor", entityID, "error", err)
-			continue
-		}
-
-		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			logger.Warnw("Failed to read sensor response", "sensor", entityID, "error", err)
-			continue
-		}
-
-		var data sensorData
-		if err := json.Unmarshal(body, &data); err != nil {
-			logger.Warnw("Failed to parse sensor response", "sensor", entityID, "error", err)
-			continue
-		}
-
-		esphome.updateSlider(idx, data.Value)
-	}
 }
 
 // sseLoop maintains the SSE connection, reconnecting with exponential backoff on failure.
@@ -266,7 +271,11 @@ func (esphome *ESPHome) runSSEStream(logger *zap.SugaredLogger) error {
 				eventType = ""
 				continue
 			}
-			if idx := esphome.findSliderIndex(data.Id); idx >= 0 {
+			id := data.NameId
+			if id == "" {
+				id = data.Id
+			}
+			if idx := esphome.findSliderIndex(id); idx >= 0 {
 				esphome.updateSlider(idx, data.Value)
 			}
 			eventType = ""
@@ -283,14 +292,30 @@ func (esphome *ESPHome) runSSEStream(logger *zap.SugaredLogger) error {
 	return fmt.Errorf("SSE stream closed by server")
 }
 
-// findSliderIndex maps an SSE entity ID (e.g. "sensor-input_0") to a slider index.
-func (esphome *ESPHome) findSliderIndex(sseID string) int {
+// findSliderIndex maps an ESPHome entity id to a slider index. It accepts both
+// the legacy "sensor-object_id" format and the current "sensor/Entity Name"
+// (or "sensor/device/Entity Name") format introduced in ESPHome 2026.8.0.
+func (esphome *ESPHome) findSliderIndex(id string) int {
+	slug := sanitizeEntityName(id)
+	if slashIdx := strings.LastIndex(id, "/"); slashIdx >= 0 {
+		slug = sanitizeEntityName(id[slashIdx+1:])
+	} else if strings.HasPrefix(id, "sensor-") {
+		slug = strings.TrimPrefix(id, "sensor-")
+	}
+
 	for i, name := range esphome.deej.config.ESPHomeSliderNames {
-		if sseID == "sensor-"+name {
+		if slug == name {
 			return i
 		}
 	}
 	return -1
+}
+
+// sanitizeEntityName slugifies an ESPHome entity name the way ESPHome derives
+// object IDs from friendly names, e.g. "Input 0" -> "input_0".
+func sanitizeEntityName(name string) string {
+	slug := entityNameSanitizer.ReplaceAllString(strings.ToLower(name), "_")
+	return strings.Trim(slug, "_")
 }
 
 // updateSlider converts a raw sensor value to a normalised volume scalar,

@@ -18,8 +18,9 @@ invert_sliders: false
 # ESPHome device settings
 esphome_ip: 192.168.1.50
 
-# ESPHome sensor entity IDs as used in the REST API path /sensor/<id>
-# SSE events use "sensor-<id>" format — deej handles the conversion automatically.
+# ESPHome sensor entity IDs, matched against the sanitized (lowercase,
+# underscored) entity name reported by ESPHome, e.g. "Input 0" -> input_0.
+# Works with both the legacy and the current ESPHome id format automatically.
 esphome_mapping:
   - input_0
   - input_1

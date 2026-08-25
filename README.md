@@ -13,7 +13,7 @@ I've cut down this README to items relevant only to this fork, and would encoura
 ### Software
 
 - The code running on the ESPHome board is a standard ESPHome firmware with custom sensors ([example configuration](./arduino/esphome-sample.yaml)). These are constantly queried by the PC client through it's built-in REST API.
-- The PC runs a lightweight [Go client](./pkg/deej/cmd/main.go) in the background. This client connects to the ESPHome device by IP address, and makes simple HTTP GET commands to determine the sensor statusus.
+- The PC runs a lightweight [Go client](./pkg/deej/cmd/main.go) in the background. This client connects to the ESPHome device by IP address and subscribes to its Server-Sent Events stream (`/events`) to receive sensor updates in real time.
 
 ## Slider mapping (configuration)
 
