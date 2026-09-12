@@ -321,8 +321,8 @@ func sanitizeEntityName(name string) string {
 // updateSlider converts a raw sensor value to a normalised volume scalar,
 // applies noise reduction, and emits a SliderMoveEvent if the value changed.
 func (esphome *ESPHome) updateSlider(idx int, rawValue float64) {
-	// ESPHome ADC sensors report 0–1023
-	dirtyFloat := float32(rawValue) / 1023.0
+	// ESPHome ADC sensors report 0–100 (native percent)
+	dirtyFloat := float32(rawValue) / 100.0
 	normalizedScalar := util.NormalizeScalar(dirtyFloat)
 
 	if esphome.deej.config.InvertSliders {
