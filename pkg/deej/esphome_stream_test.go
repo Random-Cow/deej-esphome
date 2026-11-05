@@ -146,6 +146,8 @@ func TestRunSSEStreamParsesStateEvents(t *testing.T) {
 		stateFrame(`{"id":"sensor-input_0","value":25,"state":"25"}`),
 		stateFrame(`{"id":"sensor-input_1","name_id":"sensor/Input 1","value":75,"state":"75"}`),
 		"event: state\ndata: {not json\n\n",
+		stateFrame(`{"id":"switch/Projector Power","value":false,"state":"OFF"}`),
+		stateFrame(`{"id":"text_sensor/Input 0","value":"POW=OFF","state":"POW=OFF"}`),
 		stateFrame(`{"id":"sensor/WiFi Signal","value":-60}`),
 	)
 

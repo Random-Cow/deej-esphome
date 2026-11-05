@@ -82,11 +82,13 @@ type ESPHomeStatus struct {
 // on those versions it carries the new "domain/entity_name" format while Id still
 // carries the legacy "domain-object_id" format, so it takes priority when present.
 type sensorData struct {
-	Id     string  `json:"id"`
-	NameId string  `json:"name_id"`
-	Name   string  `json:"name"`
-	State  string  `json:"state"`
-	Value  float64 `json:"value"`
+	Id     string `json:"id"`
+	NameId string `json:"name_id"`
+	Name   string `json:"name"`
+	State  string `json:"state"`
+	// Value is a number for sensors, but a bool or string for other entity
+	// types (switches, text sensors, ...) that share the same stream.
+	Value any `json:"value"`
 }
 
 // NewESPHome creates an ESPHome instance using the provided deej config.
@@ -354,8 +356,10 @@ func (esphome *ESPHome) runSSEStream(ctx context.Context, logger *zap.SugaredLog
 			if id == "" {
 				id = data.Id
 			}
-			if idx := esphome.findSliderIndex(id); idx >= 0 {
-				esphome.updateSlider(idx, data.Value)
+			if value, isNumber := data.Value.(float64); isNumber {
+				if idx := esphome.findSliderIndex(id); idx >= 0 {
+					esphome.updateSlider(idx, value)
+				}
 			}
 			eventType = ""
 
