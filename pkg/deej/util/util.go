@@ -60,9 +60,11 @@ func OpenExternal(logger *zap.SugaredLogger, cmd string, arg string) error {
 	return nil
 }
 
-// NormalizeScalar "trims" the given float32 to 2 points of precision (e.g. 0.15442 -> 0.15)
+// NormalizeScalar rounds the given float32 to 2 points of precision (e.g. 0.15442 -> 0.15).
+// It rounds instead of truncating, since float32 values like 0.9 are stored as
+// 0.89999998 and would otherwise come out as 0.89.
 func NormalizeScalar(v float32) float32 {
-	return float32(math.Floor(float64(v)*100) / 100.0)
+	return float32(math.Round(float64(v)*100) / 100.0)
 }
 
 // SignificantlyDifferent returns true if there's a significant enough volume difference between two given values
