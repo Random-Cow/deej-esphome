@@ -24,7 +24,7 @@ jobs:
           go install github.com/google/go-licenses/v2@latest
           go-licenses save ./pkg/deej/cmd --save_path THIRD_PARTY_LICENSES --ignore github.com/Random-Cow/deej-esphome
 
-      - uses: goreleaser/goreleaser-action@v6
+      - uses: goreleaser/goreleaser-action@v7
         with:
           version: "~> v2"
           args: release --clean
