@@ -1,0 +1,49 @@
+name: Bug report
+description: Something doesn't work as expected
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: input
+    id: deej-version
+    attributes:
+      label: deej-esphome version
+      description: Shown in the tray menu, or the release you downloaded.
+    validations:
+      required: true
+  - type: input
+    id: esphome-version
+    attributes:
+      label: ESPHome version
+      description: The version your controller firmware was built with.
+    validations:
+      required: true
+  - type: input
+    id: distro
+    attributes:
+      label: Distribution and desktop
+      placeholder: e.g. Arch Linux, KDE Plasma 6 (Wayland)
+  - type: dropdown
+    id: audio
+    attributes:
+      label: Audio server
+      options:
+        - PipeWire (pipewire-pulse)
+        - PulseAudio
+        - Not sure
+  - type: textarea
+    id: config
+    attributes:
+      label: config.yaml
+      render: yaml
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Run `deej -v` or `journalctl --user -u deej -n 200`. Remove anything you don't want to share.
+      render: text

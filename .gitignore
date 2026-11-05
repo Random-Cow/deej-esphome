@@ -1,17 +1,19 @@
-venv/
-*.pyc
-*.db
-.DS_Store
-*.log
-.vscode
-*.lnk
-*.exe
-deej-dev
-deej-release
-releases/
-*.bin
+# build output
+/deej
+/dist/
+/THIRD_PARTY_LICENSES/
+
+# runtime files written next to the binary / working directory
 logs/
 preferences.yaml
+/config.yaml
+*.log
 
-*.tar.gz
-release/
+# ESPHome build artefacts and secrets
+esphome/.esphome/
+esphome/secrets.yaml
+
+# editors / OS
+.vscode/
+.idea/
+.DS_Store

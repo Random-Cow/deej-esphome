@@ -12,7 +12,7 @@ ExecStart=%h/.local/bin/deej
 Restart=on-failure
 RestartSec=5
 
-# Keep logs clean — deej writes to stderr when not in release mode.
+# deej logs to stderr (and ~/.local/state/deej/deej-latest-run.log).
 # Use journalctl --user -u deej -f to follow logs.
 StandardOutput=journal
 StandardError=journal

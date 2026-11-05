@@ -1,0 +1,38 @@
+version: 2
+
+project_name: deej-esphome
+
+builds:
+  - id: deej
+    main: ./pkg/deej/cmd
+    binary: deej
+    env:
+      - CGO_ENABLED=0
+    goos: [linux]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X main.versionTag={{ .Tag }} -X main.gitCommit={{ .ShortCommit }} -X main.buildType=release
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
+      - config.example.yaml
+      - contrib/deej.service
+      - esphome/deej-esphome.yaml
+      - THIRD_PARTY_LICENSES/**/*
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - "^chore:"
