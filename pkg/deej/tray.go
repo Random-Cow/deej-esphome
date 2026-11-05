@@ -90,8 +90,10 @@ func (d *Deej) initializeTray(onDone func()) {
 			}
 		}()
 
-		// actually start the main runtime
-		onDone()
+		// actually start the main runtime. this must not block onReady:
+		// systray (>= 1.12) only serves the menu over D-Bus after onReady
+		// has returned, so a blocking call here leaves the tray menu dead.
+		go onDone()
 	}
 
 	onExit := func() {
