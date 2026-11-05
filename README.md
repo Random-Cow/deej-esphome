@@ -16,7 +16,9 @@
   <a href="LICENSE"><img src="https://img.shields.io/github/license/Random-Cow/deej-esphome" alt="MIT license"></a>
 </p>
 
-<!-- TODO: add a photo/GIF of the controller and a screenshot of the tray menu here -->
+<p align="center">
+  <img src="assets/screenshots/display.png" alt="Controller display showing five volume gauges for Firefox, Spotify, video calls, games and the microphone, above a row of Home Assistant scene buttons" width="720">
+</p>
 
 deej-esphome is a fork of [deej](https://github.com/omriharel/deej), the open-source hardware volume mixer. Instead of an Arduino on a serial port, it uses an **ESP32 running [ESPHome](https://esphome.io)** and receives slider positions **over WiFi in real time**. Because the controller is an ordinary ESPHome device, the same knobs can also drive lights or scenes in Home Assistant, or control several PCs at once.
 
@@ -31,6 +33,14 @@ deej-esphome is a fork of [deej](https://github.com/omriharel/deej), the open-so
 - **Tray icon** showing connection status, current slider positions and active sessions.
 - **Plays well with Home Assistant**: the same ESPHome device can use the native API at the same time.
 - **Static binary**: no GTK/C dependencies. Runs as a systemd user service.
+
+## Screenshots
+
+| Tray menu on the PC | The same sliders in Home Assistant |
+| :---: | :---: |
+| <img src="assets/screenshots/tray-menu.png" alt="deej tray menu showing the ESPHome connection, current slider positions and active audio sessions" width="420"> | <img src="assets/screenshots/home-assistant.png" alt="Home Assistant entity list with the five slider inputs as percentage sensors" width="340"> |
+
+The display at the top is an optional extra on the controller. It shows the slider positions in ESPHome and isn't needed for deej.
 
 ## How it works
 
