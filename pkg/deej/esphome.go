@@ -2,9 +2,11 @@ package deej
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"regexp"
 	"strings"
@@ -20,10 +22,23 @@ const (
 	sseReconnectBaseDelay = time.Second
 	sseReconnectMaxDelay  = time.Minute
 
+	// ESPHome's web_server sends a "ping" event roughly every 10 seconds. If
+	// nothing at all arrives for this long, the connection is considered dead
+	// (e.g. the device lost power or WiFi without closing the TCP connection).
+	sseIdleTimeout = 30 * time.Second
+
+	// timeouts for establishing the HTTP connection. The stream itself has no
+	// overall timeout since it's meant to stay open indefinitely.
+	httpDialTimeout           = 5 * time.Second
+	httpResponseHeaderTimeout = 5 * time.Second
+
 	// how long Start() waits for the SSE stream's initial state replay before
 	// returning, so callers can apply real slider values right after startup.
 	initialSyncTimeout = 2 * time.Second
 	initialSyncPoll    = 50 * time.Millisecond
+
+	// how long Stop() waits for the SSE goroutine to wind down.
+	stopTimeout = 2 * time.Second
 )
 
 // non-alphanumeric run matcher used to slugify ESPHome entity names the same
@@ -35,7 +50,14 @@ type ESPHome struct {
 	deej   *Deej
 	logger *zap.SugaredLogger
 
-	stopChannel    chan bool
+	client      *http.Client
+	idleTimeout time.Duration
+
+	ctx    context.Context
+	cancel context.CancelFunc
+	done   chan struct{}
+
+	started        bool
 	connected      bool
 	connectedSince time.Time
 	reconnectCount int
@@ -77,10 +99,24 @@ func NewESPHome(deej *Deej, logger *zap.SugaredLogger) (*ESPHome, error) {
 		currentValues[i] = -1.0 // sentinel: force emission on first real value
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+
 	esphome := &ESPHome{
-		deej:                       deej,
-		logger:                     logger,
-		stopChannel:                make(chan bool),
+		deej:   deej,
+		logger: logger,
+		client: &http.Client{
+			Transport: &http.Transport{
+				DialContext: (&net.Dialer{
+					Timeout:   httpDialTimeout,
+					KeepAlive: 15 * time.Second,
+				}).DialContext,
+				ResponseHeaderTimeout: httpResponseHeaderTimeout,
+			},
+		},
+		idleTimeout:                sseIdleTimeout,
+		ctx:                        ctx,
+		cancel:                     cancel,
+		done:                       make(chan struct{}),
 		currentSliderPercentValues: currentValues,
 		sliderMoveConsumers:        []chan SliderMoveEvent{},
 	}
@@ -98,15 +134,19 @@ func NewESPHome(deej *Deej, logger *zap.SugaredLogger) (*ESPHome, error) {
 // after initialSyncTimeout if the device is unreachable; the SSE loop keeps
 // retrying in the background regardless.
 func (esphome *ESPHome) Start() error {
-	if esphome.connected {
-		esphome.logger.Warn("Already connected, can't start another without closing first")
+	esphome.lock.Lock()
+	if esphome.started {
+		esphome.lock.Unlock()
+		esphome.logger.Warn("Already started, can't start another without closing first")
 		return errors.New("ESPHome: connection already active")
 	}
+	esphome.started = true
+	esphome.lock.Unlock()
 
 	go esphome.sseLoop()
 
 	deadline := time.Now().Add(initialSyncTimeout)
-	for time.Now().Before(deadline) {
+	for time.Now().Before(deadline) && esphome.ctx.Err() == nil {
 		if esphome.hasReceivedInitialValues() {
 			break
 		}
@@ -130,9 +170,24 @@ func (esphome *ESPHome) hasReceivedInitialValues() bool {
 	return false
 }
 
-// Stop signals the ESPHome goroutine to shut down.
+// Stop shuts down the SSE connection and waits (briefly) for it to close.
+// It's safe to call even if Start was never called, and more than once.
 func (esphome *ESPHome) Stop() {
-	esphome.stopChannel <- true
+	esphome.cancel()
+
+	esphome.lock.Lock()
+	started := esphome.started
+	esphome.lock.Unlock()
+
+	if !started {
+		return
+	}
+
+	select {
+	case <-esphome.done:
+	case <-time.After(stopTimeout):
+		esphome.logger.Warn("Timed out waiting for SSE stream to close")
+	}
 }
 
 // SubscribeToSliderMoveEvents returns a channel that receives a SliderMoveEvent
@@ -186,41 +241,53 @@ func (esphome *ESPHome) setupOnConfigReload() {
 	}()
 }
 
+// eventsURL builds the SSE endpoint URL from the configured address, which may
+// be an IP, a hostname (e.g. "deej.local"), "host:port", or include "http://".
+func eventsURL(address string) string {
+	address = strings.TrimSpace(address)
+	address = strings.TrimPrefix(address, "http://")
+	address = strings.TrimSuffix(address, "/")
+	return fmt.Sprintf("http://%s/events", address)
+}
+
 // sseLoop maintains the SSE connection, reconnecting with exponential backoff on failure.
 func (esphome *ESPHome) sseLoop() {
+	defer close(esphome.done)
+
 	logger := esphome.logger.Named(esphome.deej.config.ESPHomeIpAddr)
 
 	backoff := sseReconnectBaseDelay
 
 	for {
-		select {
-		case <-esphome.stopChannel:
-			esphome.lock.Lock()
-			esphome.connected = false
-			esphome.lock.Unlock()
-			return
-		default:
-		}
+		wasConnected, err := esphome.runSSEStream(esphome.ctx, logger)
 
-		err := esphome.runSSEStream(logger)
-		if err != nil {
-			esphome.lock.Lock()
-			esphome.connected = false
+		esphome.lock.Lock()
+		esphome.connected = false
+		if esphome.ctx.Err() == nil {
 			esphome.reconnectCount++
-			esphome.lock.Unlock()
-			logger.Warnw("SSE stream ended, reconnecting", "error", err, "backoff", backoff)
+		}
+		esphome.lock.Unlock()
+
+		if esphome.ctx.Err() != nil {
+			logger.Debug("SSE loop stopped")
+			return
 		}
 
+		// a connection that actually worked resets the backoff, so a single
+		// hiccup after hours of uptime doesn't inherit an old, long delay
+		if wasConnected {
+			backoff = sseReconnectBaseDelay
+		}
+
+		logger.Warnw("SSE stream ended, reconnecting", "error", err, "backoff", backoff)
+
 		select {
-		case <-esphome.stopChannel:
-			esphome.lock.Lock()
-			esphome.connected = false
-			esphome.lock.Unlock()
+		case <-esphome.ctx.Done():
+			logger.Debug("SSE loop stopped")
 			return
 		case <-time.After(backoff):
 		}
 
-		// exponential backoff
 		backoff *= 2
 		if backoff > sseReconnectMaxDelay {
 			backoff = sseReconnectMaxDelay
@@ -229,15 +296,28 @@ func (esphome *ESPHome) sseLoop() {
 }
 
 // runSSEStream opens GET /events and processes the Server-Sent Events stream.
-// Returns when the stream ends or an error occurs.
-func (esphome *ESPHome) runSSEStream(logger *zap.SugaredLogger) error {
-	url := fmt.Sprintf("http://%s/events", esphome.deej.config.ESPHomeIpAddr)
+// It returns when the stream ends, an error occurs, the stream goes silent for
+// longer than the idle timeout, or ctx is cancelled. wasConnected reports
+// whether the HTTP connection was established successfully.
+func (esphome *ESPHome) runSSEStream(ctx context.Context, logger *zap.SugaredLogger) (wasConnected bool, err error) {
+	connCtx, cancelConn := context.WithCancel(ctx)
+	defer cancelConn()
 
-	resp, err := http.Get(url)
+	req, err := http.NewRequestWithContext(connCtx, http.MethodGet, eventsURL(esphome.deej.config.ESPHomeIpAddr), nil)
 	if err != nil {
-		return fmt.Errorf("connect to SSE: %w", err)
+		return false, fmt.Errorf("build SSE request: %w", err)
 	}
-	defer resp.Body.Close()
+	req.Header.Set("Accept", "text/event-stream")
+
+	resp, err := esphome.client.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("connect to SSE: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("connect to SSE: unexpected HTTP status %s (is web_server enabled?)", resp.Status)
+	}
 
 	esphome.lock.Lock()
 	esphome.connected = true
@@ -246,16 +326,15 @@ func (esphome *ESPHome) runSSEStream(logger *zap.SugaredLogger) error {
 
 	logger.Infow("Connected to ESPHome SSE stream")
 
+	// tear the connection down if the device goes silent
+	watchdog := time.AfterFunc(esphome.idleTimeout, cancelConn)
+	defer watchdog.Stop()
+
 	scanner := bufio.NewScanner(resp.Body)
 	var eventType string
 
 	for scanner.Scan() {
-		select {
-		case <-esphome.stopChannel:
-			esphome.stopChannel <- true // put it back for sseLoop to read
-			return nil
-		default:
-		}
+		watchdog.Reset(esphome.idleTimeout)
 
 		line := scanner.Text()
 
@@ -285,11 +364,16 @@ func (esphome *ESPHome) runSSEStream(logger *zap.SugaredLogger) error {
 		}
 	}
 
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("SSE stream read error: %w", err)
+	switch {
+	case ctx.Err() != nil:
+		return true, ctx.Err()
+	case connCtx.Err() != nil:
+		return true, fmt.Errorf("no data received for %s, assuming connection is dead", esphome.idleTimeout)
+	case scanner.Err() != nil:
+		return true, fmt.Errorf("SSE stream read error: %w", scanner.Err())
 	}
 
-	return fmt.Errorf("SSE stream closed by server")
+	return true, errors.New("SSE stream closed by server")
 }
 
 // findSliderIndex maps an ESPHome entity id to a slider index. It accepts both

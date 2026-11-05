@@ -32,9 +32,6 @@ func NewToastNotifier(logger *zap.SugaredLogger) (*ToastNotifier, error) {
 		logger.Debugw("Writing notification icon to temp file", "path", appIconPath)
 
 		iconData := icon.DeejLogoPNG
-		if len(iconData) == 0 {
-			iconData = icon.DeejLogo
-		}
 
 		f, err := os.Create(appIconPath)
 		if err != nil {
@@ -45,7 +42,9 @@ func NewToastNotifier(logger *zap.SugaredLogger) (*ToastNotifier, error) {
 				logger.Warnw("Failed to write notification icon", "error", err)
 				appIconPath = ""
 			}
-			f.Close()
+			if err := f.Close(); err != nil {
+				logger.Warnw("Failed to close notification icon file", "error", err)
+			}
 		}
 	}
 

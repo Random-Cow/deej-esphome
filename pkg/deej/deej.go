@@ -151,6 +151,8 @@ func (d *Deej) setupInterruptHandler() {
 }
 
 func (d *Deej) run() {
+	defer d.recoverFromPanic()
+
 	d.logger.Info("Run loop starting")
 
 	// watch the config file for changes
@@ -203,7 +205,7 @@ func (d *Deej) stop() error {
 	d.stopTray()
 
 	// attempt to sync on exit - this won't necessarily work but can't harm
-	d.logger.Sync()
+	_ = d.logger.Sync()
 
 	return nil
 }

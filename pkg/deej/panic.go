@@ -3,7 +3,6 @@ package deej
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -20,8 +19,8 @@ const (
                         deej crashlog
 -----------------------------------------------------------------
 Unfortunately, deej has crashed. This really shouldn't happen!
-If you've just encountered this, please contact the maintainer and attach this error log.
-You can also join the deej Discord server at https://discord.gg/nf88NJu.
+If you've just encountered this, please open an issue and attach this error log:
+https://github.com/Random-Cow/deej-esphome/issues
 -----------------------------------------------------------------
 Time: %s
 Panic occurred: %s
@@ -50,7 +49,7 @@ func (d *Deej) recoverFromPanic() {
 	crashlogPath := filepath.Join(logDirectory, fmt.Sprintf(crashlogFilename, now.Format(crashlogTimestampFormat)))
 
 	// that would REALLY suck
-	if err := ioutil.WriteFile(crashlogPath, crashlogBytes.Bytes(), os.ModePerm); err != nil {
+	if err := os.WriteFile(crashlogPath, crashlogBytes.Bytes(), 0o644); err != nil {
 		panic(fmt.Errorf("can't even write the crashlog file contents: %w", err))
 	}
 

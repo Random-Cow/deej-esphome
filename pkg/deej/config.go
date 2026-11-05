@@ -3,7 +3,6 @@ package deej
 import (
 	"fmt"
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -38,8 +37,6 @@ type CanonicalConfig struct {
 }
 
 const (
-	internalConfigFilepath = "preferences.yaml"
-
 	userConfigName     = "config"
 	internalConfigName = "preferences"
 
@@ -58,15 +55,8 @@ var (
 	userConfigPath     = "."           // directory searched by viper
 )
 
-// has to be defined as a non-constant because we're using path.Join
-var internalConfigPath = path.Join(".", logDirectory)
-
-var defaultSliderMapping = func() *sliderMap {
-	emptyMap := newSliderMap()
-	emptyMap.set(0, []string{masterSessionName})
-
-	return emptyMap
-}()
+// internal preferences live next to the logs (see logDirectory)
+var internalConfigPath = logDirectory
 
 // NewConfig creates a config instance for the deej object and sets up viper instances for deej's config files
 func NewConfig(logger *zap.SugaredLogger, notifier Notifier) (*CanonicalConfig, error) {
@@ -151,6 +141,12 @@ func (cc *CanonicalConfig) Load() error {
 	if err := cc.populateFromVipers(); err != nil {
 		cc.logger.Warnw("Failed to populate config fields", "error", err)
 		return fmt.Errorf("populate config fields: %w", err)
+	}
+
+	if err := cc.validate(); err != nil {
+		cc.logger.Warnw("Invalid config", "error", err)
+		cc.notifier.Notify("Invalid configuration!", err.Error())
+		return fmt.Errorf("validate config: %w", err)
 	}
 
 	cc.logger.Info("Loaded config successfully")
@@ -241,6 +237,20 @@ func (cc *CanonicalConfig) populateFromVipers() error {
 	cc.NoiseReductionLevel = cc.userConfig.GetString(configKeyNoiseReductionLevel)
 
 	cc.logger.Debug("Populated config fields from vipers")
+
+	return nil
+}
+
+// validate checks for settings deej can't run without, so the user gets a
+// clear message instead of a silently idle mixer.
+func (cc *CanonicalConfig) validate() error {
+	if strings.TrimSpace(cc.ESPHomeIpAddr) == "" {
+		return fmt.Errorf("%s is not set in %s", configKeyESPHomeIp, userConfigFilepath)
+	}
+
+	if len(cc.ESPHomeSliderNames) == 0 {
+		return fmt.Errorf("%s is empty in %s; list your ESPHome sensor ids (e.g. input_0)", configKeyESPHomeMapping, userConfigFilepath)
+	}
 
 	return nil
 }

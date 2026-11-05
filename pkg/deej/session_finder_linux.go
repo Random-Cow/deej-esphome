@@ -8,16 +8,6 @@ import (
 	"go.uber.org/zap"
 )
 
-// PulseAudio subscription constants (from pulseaudio/pulseaudio.h)
-const (
-	subscriptionMaskSinkInput          uint32 = 0x0004
-	subscriptionEventFacilityMask      uint32 = 0x000F
-	subscriptionEventTypeMask          uint32 = 0x0030
-	subscriptionEventFacilitySinkInput uint32 = 0x0002
-	subscriptionEventTypeNew           uint32 = 0x0000
-	subscriptionEventTypeChange        uint32 = 0x0010
-)
-
 type paSessionFinder struct {
 	logger        *zap.SugaredLogger
 	sessionLogger *zap.SugaredLogger
@@ -58,7 +48,7 @@ func newSessionFinder(logger *zap.SugaredLogger) (SessionFinder, error) {
 
 	// Subscribe to sink-input events (new, change, remove) so we can react
 	// immediately and fight back when other software overrides our volumes.
-	if err := client.Request(&proto.Subscribe{Mask: subscriptionMaskSinkInput}, nil); err != nil {
+	if err := client.Request(&proto.Subscribe{Mask: proto.SubscriptionMaskSinkInput}, nil); err != nil {
 		sf.logger.Warnw("Failed to subscribe to PulseAudio sink-input events, volume-spike prevention disabled", "error", err)
 	} else {
 		client.Callback = func(msg interface{}) {
@@ -66,21 +56,21 @@ func newSessionFinder(logger *zap.SugaredLogger) (SessionFinder, error) {
 			if !ok {
 				return
 			}
-			facility := event.Event & subscriptionEventFacilityMask
-			eventType := event.Event & subscriptionEventTypeMask
+			facility := event.Event.GetFacility()
+			eventType := event.Event.GetType()
 
-			if facility != subscriptionEventFacilitySinkInput {
+			if facility != proto.EventSinkSinkInput {
 				return
 			}
 
 			switch eventType {
-			case subscriptionEventTypeNew:
+			case proto.EventNew:
 				// Non-blocking: buffer absorbs bursts; any overflow is caught by the next periodic refresh.
 				select {
 				case sf.newSinkInputCh <- event.Index:
 				default:
 				}
-			case subscriptionEventTypeChange:
+			case proto.EventChange:
 				// Also non-blocking. Session map uses these to fight back when an app
 				// (Firefox, Spotify, WirePlumber) overrides the volume we set.
 				select {

@@ -35,8 +35,8 @@ func TestFindSliderIndex(t *testing.T) {
 
 func TestSanitizeEntityName(t *testing.T) {
 	cases := map[string]string{
-		"Input 0":       "input_0",
-		"input_0":       "input_0",
+		"Input 0":        "input_0",
+		"input_0":        "input_0",
 		"WiFi Signal dB": "wifi_signal_db",
 		"  Trim Me  ":    "trim_me",
 	}

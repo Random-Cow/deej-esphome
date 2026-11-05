@@ -2,6 +2,7 @@ package deej
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"fyne.io/systray"
@@ -12,12 +13,9 @@ import (
 
 const trayStatusRefreshInterval = 3 * time.Second
 
-// loadTrayIcon returns the embedded PNG icon bytes for Linux.
+// loadTrayIcon returns the embedded PNG icon bytes.
 func loadTrayIcon() []byte {
-	if len(icon.DeejLogoPNG) > 0 {
-		return icon.DeejLogoPNG
-	}
-	return icon.DeejLogo
+	return icon.DeejLogoPNG
 }
 
 func (d *Deej) initializeTray(onDone func()) {
@@ -139,7 +137,7 @@ func updateTrayStatus(d *Deej, connItem, sliderItem, sessionItem *systray.MenuIt
 				parts = append(parts, fmt.Sprintf("%s:%d%%", label, int(v*100)))
 			}
 		}
-		sliderItem.SetTitle("Sliders: " + joinStrings(parts, "  "))
+		sliderItem.SetTitle("Sliders: " + strings.Join(parts, "  "))
 	} else {
 		sliderItem.SetTitle("Sliders: –")
 	}
@@ -149,18 +147,6 @@ func updateTrayStatus(d *Deej, connItem, sliderItem, sessionItem *systray.MenuIt
 		count := d.sessions.SessionCount()
 		sessionItem.SetTitle(fmt.Sprintf("Sessions: %d active", count))
 	}
-}
-
-// joinStrings joins a slice of strings with a separator.
-func joinStrings(ss []string, sep string) string {
-	result := ""
-	for i, s := range ss {
-		if i > 0 {
-			result += sep
-		}
-		result += s
-	}
-	return result
 }
 
 func (d *Deej) stopTray() {
