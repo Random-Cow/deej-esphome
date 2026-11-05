@@ -16,7 +16,7 @@ slider_mapping:
 invert_sliders: false
 
 # ESPHome device settings
-esphome_ip: 192.168.1.50
+esphome_ip: deej.local   # hostname (mDNS), IP or host:port
 
 # ESPHome sensor entity IDs, matched against the sanitized (lowercase,
 # underscored) entity name reported by ESPHome, e.g. "Input 0" -> input_0.

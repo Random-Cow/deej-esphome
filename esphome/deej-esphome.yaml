@@ -1,0 +1,120 @@
+# Example ESPHome firmware for a deej-esphome controller (ESP32 + potentiometers).
+#
+# deej reads the sensors below through ESPHome's built-in web server
+# (Server-Sent Events on http://<device>/events). Each slider must report a
+# value between 0 and 100. The sensor *name* ("Input 0") becomes the id you
+# list under `esphome_mapping` in deej's config.yaml ("input_0").
+#
+# Wiring: connect each potentiometer's outer legs to 3V3 and GND and the wiper
+# to one of the ADC1 pins (GPIO32-GPIO39). Don't use ADC2 pins: ADC2 can't be
+# read while WiFi is active.
+
+substitutions:
+  name: deej
+  friendly_name: deej Volume Control
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+logger:
+
+# Native API, so the same sliders can also be used in Home Assistant.
+# Remove this block if you don't use Home Assistant.
+api:
+
+ota:
+  - platform: esphome
+
+# Required by deej: provides the /events SSE stream.
+web_server:
+  port: 80
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+# Lets deej find the device as "deej.local" (set esphome_ip: deej.local).
+mdns:
+
+sensor:
+  - platform: adc
+    pin: GPIO36
+    id: input_0
+    name: "Input 0"
+    attenuation: 12db
+    update_interval: 20ms
+    unit_of_measurement: "%"
+    device_class: ""
+    accuracy_decimals: 0
+    # Shared filter chain, reused by the other sliders via the YAML alias below.
+    filters: &input_filters
+      # Reject brief noise spikes (e.g. from WiFi TX activity) before averaging.
+      - median:
+          window_size: 5
+          send_every: 1
+      # Average out remaining noise; emits every 5th reading (~100 ms).
+      - sliding_window_moving_average:
+          window_size: 5
+          send_every: 5
+      # Map the ADC voltage to 0-100 %. The small margins on both ends act as
+      # dead zones so the slider reliably reaches 0 % and 100 %.
+      - calibrate_linear:
+          - 0.1 -> 0.0
+          - 3.0 -> 100.0
+      - clamp:
+          min_value: 0
+          max_value: 100
+      - round: 0
+      # Only publish actual changes to keep the event stream quiet.
+      - delta: 1.0
+
+  # Additional sliders only need pin/id/name; the filter chain comes from the alias.
+  - platform: adc
+    pin: GPIO39
+    id: input_1
+    name: "Input 1"
+    attenuation: 12db
+    update_interval: 20ms
+    unit_of_measurement: "%"
+    device_class: ""
+    accuracy_decimals: 0
+    filters: *input_filters
+
+  - platform: adc
+    pin: GPIO34
+    id: input_2
+    name: "Input 2"
+    attenuation: 12db
+    update_interval: 20ms
+    unit_of_measurement: "%"
+    device_class: ""
+    accuracy_decimals: 0
+    filters: *input_filters
+
+  - platform: adc
+    pin: GPIO35
+    id: input_3
+    name: "Input 3"
+    attenuation: 12db
+    update_interval: 20ms
+    unit_of_measurement: "%"
+    device_class: ""
+    accuracy_decimals: 0
+    filters: *input_filters
+
+  - platform: adc
+    pin: GPIO32
+    id: input_4
+    name: "Input 4"
+    attenuation: 12db
+    update_interval: 20ms
+    unit_of_measurement: "%"
+    device_class: ""
+    accuracy_decimals: 0
+    filters: *input_filters
