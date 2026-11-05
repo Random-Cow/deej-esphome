@@ -1,68 +1,137 @@
-# deej-esphome
+<p align="center">
+  <img src="assets/logo.svg" alt="deej-esphome logo" width="140">
+</p>
 
-Deej-esphome is a fork of the [Deej project](https://github.com/omriharel/deej) build to query a ESPHome device through it's REST API over WiFi. This allows the device to also control smart home devices, as well as the computer volume, potentially across multiple systems simultaneously using the same controller (or even the same slider).
+<h1 align="center">deej-esphome</h1>
 
-In theory, any sensor can be used to control the volume, allowing for some useful, and some silly automation.
+<p align="center">
+  <b>A wireless hardware volume mixer for Linux.</b><br>
+  Turn physical sliders on an ESPHome device into per-app volume control for PipeWire and PulseAudio, with no USB cable.
+</p>
 
-This could also be trivally extended to make use of any JSON REST API, not just ESPHome's.
+<p align="center">
+  <a href="https://github.com/Random-Cow/deej-esphome/actions/workflows/ci.yml"><img src="https://github.com/Random-Cow/deej-esphome/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/Random-Cow/deej-esphome/releases/latest"><img src="https://img.shields.io/github/v/release/Random-Cow/deej-esphome" alt="Latest release"></a>
+  <a href="go.mod"><img src="https://img.shields.io/github/go-mod/go-version/Random-Cow/deej-esphome" alt="Go version"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/Random-Cow/deej-esphome" alt="MIT license"></a>
+</p>
 
-I've cut down this README to items relevant only to this fork, and would encourage you to read [original README](https://github.com/omriharel/deej) first.
+<!-- TODO: add a photo/GIF of the controller and a screenshot of the tray menu here -->
+
+deej-esphome is a fork of [deej](https://github.com/omriharel/deej), the open-source hardware volume mixer. Instead of an Arduino on a serial port, it uses an **ESP32 running [ESPHome](https://esphome.io)** and receives slider positions **over WiFi in real time**. Because the controller is an ordinary ESPHome device, the same knobs can also drive lights or scenes in Home Assistant, or control several PCs at once.
+
+## Features
+
+- **Wireless**: the controller only needs power. deej connects to it over your network.
+- **Real time**: uses ESPHome's Server-Sent Events stream (`/events`), so there's no polling and no lag.
+- **Per-app volume**: map sliders to apps, groups of apps, glob patterns (`firefox*`), `master`, `mic` or `deej.unmapped` (everything else).
+- **Holds its ground**: re-applies your volume when apps such as Firefox, Spotify or WirePlumber try to override it.
+- **Robust connection**: reconnects automatically with backoff and detects dead WiFi links within 30 s.
+- **Hot reload**: edit the config while deej is running and changes apply instantly.
+- **Tray icon** showing connection status, current slider positions and active sessions.
+- **Plays well with Home Assistant**: the same ESPHome device can use the native API at the same time.
+- **Static binary**: no GTK/C dependencies. Runs as a systemd user service.
 
 ## How it works
 
-### Software
+```text
+ ┌────────────────────┐      WiFi / HTTP SSE       ┌────────────┐   pulse protocol   ┌──────────────────────┐
+ │ ESP32 + ESPHome    │  ───────────────────────▶  │    deej    │  ───────────────▶  │ PipeWire (pipewire-  │
+ │ potentiometers on  │   GET /events              │ (this app) │                    │ pulse) / PulseAudio  │
+ │ ADC pins, 0–100 %  │   "Input 0" = 42           └────────────┘                    └──────────────────────┘
+ └────────────────────┘
+          │ native API (optional)
+          ▼
+   Home Assistant
+```
 
-- The code running on the ESPHome board is a standard ESPHome firmware with custom sensors ([example configuration](./arduino/esphome-sample.yaml)). These are constantly queried by the PC client through it's built-in REST API.
-- The PC runs a lightweight [Go client](./pkg/deej/cmd/main.go) in the background. This client connects to the ESPHome device by IP address and subscribes to its Server-Sent Events stream (`/events`) to receive sensor updates in real time.
+## Quick start
 
-## Slider mapping (configuration)
+### 1. Build the controller
 
-deej uses a simple YAML-formatted configuration file named [`config.yaml`](./config.yaml), placed alongside the deej executable.
+You need an ESP32 board and up to *n* 10 kΩ linear potentiometers (sliders or knobs). Wire each pot's outer legs to **3V3** and **GND** and its wiper to an **ADC1 pin (GPIO32–GPIO39)**. ADC2 pins don't work while WiFi is on.
 
-The config file determines which applications (and devices) are mapped to which sliders, and which parameters to use for the connection to the ESPHome board, as well as other user preferences.
+Flash [`esphome/deej-esphome.yaml`](esphome/deej-esphome.yaml) with ESPHome (dashboard, Home Assistant add-on or `esphome run`), after adjusting the pins to your wiring. Each sensor reports a value between 0 and 100; the sensor name `Input 0` becomes the id `input_0`.
 
-The ESPHome IP, and sensor names should also be included
+Check that it works: `curl -N http://deej.local/events` should print `state` events while you move a slider.
 
-**This file auto-reloads when its contents are changed, so you can change application mappings on-the-fly without restarting deej, though a restart will be needed if the device is changed between serial and ESPHome devices.**
+Looking for enclosure ideas? The original deej project has a big [community showcase](https://github.com/omriharel/deej/blob/master/community.md).
 
-It looks like this:
+### 2. Install deej
+
+Download the latest archive for your architecture from [Releases](https://github.com/Random-Cow/deej-esphome/releases) and put `deej` somewhere on your `PATH`, e.g. `~/.local/bin`. You can also build it from source:
+
+```sh
+git clone https://github.com/Random-Cow/deej-esphome && cd deej-esphome
+make install          # installs to ~/.local/bin and sets up the systemd user unit
+```
+
+### 3. Configure
+
+deej reads `~/.config/deej/config.yaml`. Start from [`config.example.yaml`](config.example.yaml):
 
 ```yaml
 slider_mapping:
   0: master
-  1: chrome.exe
-  2: spotify.exe
+  1: firefox*
+  2: spotify
   3:
-    - pathofexile_x64.exe
-    - rocketleague.exe
-  4: discord.exe
+    - discord
+    - teamspeak
+  4: deej.unmapped
 
-# set this to true if you want the controls inverted (i.e. top is 0%, bottom is 100%)
-invert_sliders: false
+esphome_ip: deej.local   # IP, hostname or host:port
 
-# use esphome instead of serial
-use_esphome: true
-
-esphome_ip: 192.168.1.193
-
-esphome_mapping:
+esphome_mapping:          # ESPHome sensor ids, in slider order
   - input_0
   - input_1
+  - input_2
+  - input_3
+  - input_4
 
-# settings for connecting to the arduino board
-com_port: COM4
-baud_rate: 9600
-
-# adjust the amount of signal noise reduction depending on your hardware quality
-# supported values are "low" (excellent hardware), "default" (regular hardware) or "high" (bad, noisy hardware)
+invert_sliders: false
 noise_reduction: default
 ```
 
-## Extensions
-This was coded as a weekend project by someone with no prior experience in Go, so there are bound to be quality issues. Beyond that, there's oppertunity for the following:
-- Make use of the proper ESPHome libraries that establish a API connection to the device. I attempted to get this working, but gave up after sinking too much time into it.
-- Extend to configue any REST API, not just ESPHome. This should just require a relavily trivial URL and config change, and changing the JSON parsing to be more configurable.
+### 4. Run it
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now deej
+```
+
+Or start `deej` directly from your desktop's autostart.
+
+## Configuration reference
+
+| Key | Description |
+| --- | --- |
+| `slider_mapping` | Map of slider index (starting at 0) to one target or a list of targets. Targets are process names (case-insensitive, globs like `chrom*` allowed), `master`, `mic` or `deej.unmapped`. |
+| `esphome_ip` | Address of the ESPHome device: IP, hostname (`deej.local` via mDNS) or `host:port`. |
+| `esphome_mapping` | ESPHome sensor ids in slider order. The id is the sensor name in lowercase with underscores (`Input 0` → `input_0`). Legacy and current ESPHome id formats are both supported. |
+| `invert_sliders` | `true` if 100 % should be at the bottom. |
+| `noise_reduction` | `low`, `default` or `high`. Raise it if volumes jitter. |
+
+## Troubleshooting
+
+- **Logs**: `journalctl --user -u deej -f`, or `~/.local/state/deej/deej-latest-run.log`. Run `deej -v` in a terminal for verbose output.
+- **Not connecting**: run `curl -N http://<esphome_ip>/events`. If that fails, check `web_server:` in your ESPHome config and the device's address.
+- **A slider does nothing**: compare the sensor ids from the `curl` output with `esphome_mapping`.
+- **Volume only reaches part of the range**: the firmware must report 0–100. Use the filter chain from the example YAML (older examples scaled to 0–1023).
+- **App not found**: the tray menu shows active sessions. Use the process name as reported by PipeWire, or a glob.
+
+## Credits
+
+deej-esphome stands on the shoulders of:
+
+- [**deej**](https://github.com/omriharel/deej) by Omri Harel: the original project, design and most of the code.
+- **Severin**: Linux/PulseAudio support in upstream deej.
+- **Peter Ernst**: PipeWire fix.
+- **Cristian Zănescu**: libayatana / Linux Mint compatibility.
+- The author of the first ESPHome REST port of deej, which this fork grew from.
+
+This project is an independent fork. It is **not affiliated with or endorsed by** the original deej project.
 
 ## License
 
-deej is released under the [MIT license](./LICENSE).
+[MIT](LICENSE). Release archives include the licenses of all bundled third-party Go modules.
