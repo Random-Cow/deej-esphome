@@ -113,12 +113,12 @@ func updateTrayStatus(d *Deej, connItem, sliderItem, sessionItem *systray.MenuIt
 		if status.ReconnectCount > 0 {
 			connLine += fmt.Sprintf(", %d reconnect(s)", status.ReconnectCount)
 		}
-		connItem.SetTitle(connLine)
+		setStatusTitle(connItem, connLine)
 	} else {
 		if status.ReconnectCount > 0 {
-			connItem.SetTitle(fmt.Sprintf("ESPHome %s ✗ (reconnecting, attempt %d)", status.IPAddress, status.ReconnectCount+1))
+			setStatusTitle(connItem, fmt.Sprintf("ESPHome %s ✗ (reconnecting, attempt %d)", status.IPAddress, status.ReconnectCount+1))
 		} else {
-			connItem.SetTitle(fmt.Sprintf("ESPHome %s ✗ (connecting…)", status.IPAddress))
+			setStatusTitle(connItem, fmt.Sprintf("ESPHome %s ✗ (connecting…)", status.IPAddress))
 		}
 	}
 
@@ -137,16 +137,27 @@ func updateTrayStatus(d *Deej, connItem, sliderItem, sessionItem *systray.MenuIt
 				parts = append(parts, fmt.Sprintf("%s:%d%%", label, int(v*100)))
 			}
 		}
-		sliderItem.SetTitle("Sliders: " + strings.Join(parts, "  "))
+		setStatusTitle(sliderItem, "Sliders: "+strings.Join(parts, "  "))
 	} else {
-		sliderItem.SetTitle("Sliders: –")
+		setStatusTitle(sliderItem, "Sliders: –")
 	}
 
 	// Session count line
 	if d.sessions != nil {
 		count := d.sessions.SessionCount()
-		sessionItem.SetTitle(fmt.Sprintf("Sessions: %d active", count))
+		setStatusTitle(sessionItem, fmt.Sprintf("Sessions: %d active", count))
 	}
+}
+
+// setStatusTitle sets a menu item's label. dbusmenu treats "_" as an access
+// key marker (so "input_0" would render as "input0" with an underlined 0),
+// hence literal underscores have to be doubled.
+func setStatusTitle(item *systray.MenuItem, title string) {
+	item.SetTitle(escapeMenuLabel(title))
+}
+
+func escapeMenuLabel(label string) string {
+	return strings.ReplaceAll(label, "_", "__")
 }
 
 func (d *Deej) stopTray() {
