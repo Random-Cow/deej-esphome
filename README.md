@@ -80,7 +80,7 @@ slider_mapping:
     - teamspeak
   4: deej.unmapped
 
-esphome_ip: deej.local   # IP, hostname or host:port
+esphome_address: deej.local   # IP, hostname or host:port
 
 esphome_mapping:          # ESPHome sensor ids, in slider order
   - input_0
@@ -107,7 +107,7 @@ Or start `deej` directly from your desktop's autostart.
 | Key | Description |
 | --- | --- |
 | `slider_mapping` | Map of slider index (starting at 0) to one target or a list of targets. Targets are process names (case-insensitive, globs like `chrom*` allowed), `master`, `mic` or `deej.unmapped`. |
-| `esphome_ip` | Address of the ESPHome device: IP, hostname (`deej.local` via mDNS) or `host:port`. |
+| `esphome_address` | Address of the ESPHome device: IP, hostname (`deej.local` via mDNS) or `host:port`. Changes apply without a restart. Older configs using `esphome_ip` keep working. |
 | `esphome_mapping` | ESPHome sensor ids in slider order. The id is the sensor name in lowercase with underscores (`Input 0` → `input_0`). Legacy and current ESPHome id formats are both supported. |
 | `invert_sliders` | `true` if 100 % should be at the bottom. |
 | `noise_reduction` | `low`, `default` or `high`. Raise it if volumes jitter. |
@@ -115,7 +115,7 @@ Or start `deej` directly from your desktop's autostart.
 ## Troubleshooting
 
 - **Logs**: `journalctl --user -u deej -f`, or `~/.local/state/deej/deej-latest-run.log`. Run `deej -v` in a terminal for verbose output.
-- **Not connecting**: run `curl -N http://<esphome_ip>/events`. If that fails, check `web_server:` in your ESPHome config and the device's address.
+- **Not connecting**: run `curl -N http://<esphome_address>/events`. If that fails, check `web_server:` in your ESPHome config and the device's address.
 - **A slider does nothing**: compare the sensor ids from the `curl` output with `esphome_mapping`.
 - **Volume only reaches part of the range**: the firmware must report 0–100. Use the filter chain from the example YAML (older examples scaled to 0–1023).
 - **App not found**: the tray menu shows active sessions. Use the process name as reported by PipeWire, or a glob.

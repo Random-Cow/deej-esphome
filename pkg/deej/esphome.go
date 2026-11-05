@@ -57,6 +57,15 @@ type ESPHome struct {
 	cancel context.CancelFunc
 	done   chan struct{}
 
+	// snapshot of the relevant config, refreshed on config reload. kept here
+	// (under lock) so the SSE goroutine never races with the config reloader
+	address     string
+	sliderNames []string
+
+	// cancels the current connection; used to reconnect when the address changes
+	cancelConn   context.CancelFunc
+	reconnectNow chan struct{}
+
 	started        bool
 	connected      bool
 	connectedSince time.Time
@@ -71,7 +80,8 @@ type ESPHome struct {
 // ESPHomeStatus holds a snapshot of the current ESPHome connection state.
 type ESPHomeStatus struct {
 	Connected      bool
-	IPAddress      string
+	Address        string
+	SliderNames    []string
 	ConnectedSince time.Time
 	ReconnectCount int
 	SliderValues   []float32
@@ -95,12 +105,6 @@ type sensorData struct {
 func NewESPHome(deej *Deej, logger *zap.SugaredLogger) (*ESPHome, error) {
 	logger = logger.Named("esphome")
 
-	numSliders := len(deej.config.ESPHomeSliderNames)
-	currentValues := make([]float32, numSliders)
-	for i := range currentValues {
-		currentValues[i] = -1.0 // sentinel: force emission on first real value
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 
 	esphome := &ESPHome{
@@ -108,10 +112,10 @@ func NewESPHome(deej *Deej, logger *zap.SugaredLogger) (*ESPHome, error) {
 		logger: logger,
 		client: &http.Client{
 			Transport: &http.Transport{
-				DialContext: (&net.Dialer{
+				DialContext: preferIPv4Dial(&net.Dialer{
 					Timeout:   httpDialTimeout,
 					KeepAlive: 15 * time.Second,
-				}).DialContext,
+				}),
 				ResponseHeaderTimeout: httpResponseHeaderTimeout,
 			},
 		},
@@ -119,7 +123,10 @@ func NewESPHome(deej *Deej, logger *zap.SugaredLogger) (*ESPHome, error) {
 		ctx:                        ctx,
 		cancel:                     cancel,
 		done:                       make(chan struct{}),
-		currentSliderPercentValues: currentValues,
+		reconnectNow:               make(chan struct{}, 1),
+		address:                    deej.config.ESPHomeAddress,
+		sliderNames:                append([]string(nil), deej.config.ESPHomeSliderNames...),
+		currentSliderPercentValues: newSliderValues(len(deej.config.ESPHomeSliderNames)),
 		sliderMoveConsumers:        []chan SliderMoveEvent{},
 	}
 
@@ -220,7 +227,8 @@ func (esphome *ESPHome) GetStatus() ESPHomeStatus {
 
 	return ESPHomeStatus{
 		Connected:      esphome.connected,
-		IPAddress:      esphome.deej.config.ESPHomeIpAddr,
+		Address:        esphome.address,
+		SliderNames:    append([]string(nil), esphome.sliderNames...),
 		ConnectedSince: esphome.connectedSince,
 		ReconnectCount: esphome.reconnectCount,
 		SliderValues:   values,
@@ -232,15 +240,68 @@ func (esphome *ESPHome) setupOnConfigReload() {
 
 	go func() {
 		for range configReloadedChannel {
-			// Reset values so slider move events are re-emitted after reload,
-			// ensuring the session map receives fresh volume commands.
-			esphome.lock.Lock()
-			for i := range esphome.currentSliderPercentValues {
-				esphome.currentSliderPercentValues[i] = -1.0
-			}
-			esphome.lock.Unlock()
+			esphome.applyConfig(esphome.deej.config.ESPHomeAddress, esphome.deej.config.ESPHomeSliderNames)
 		}
 	}()
+}
+
+// applyConfig takes over a (re)loaded config. Slider values are reset so
+// move events are re-emitted and the session map receives fresh volumes; if
+// the device address changed, the current connection is dropped and a new
+// one is opened right away.
+func (esphome *ESPHome) applyConfig(address string, sliderNames []string) {
+	esphome.lock.Lock()
+	addressChanged := address != esphome.address
+	esphome.address = address
+	esphome.sliderNames = append([]string(nil), sliderNames...)
+	esphome.currentSliderPercentValues = newSliderValues(len(sliderNames))
+	cancelConn := esphome.cancelConn
+	esphome.lock.Unlock()
+
+	if !addressChanged {
+		return
+	}
+
+	esphome.logger.Infow("ESPHome address changed, reconnecting", "address", address)
+
+	select {
+	case esphome.reconnectNow <- struct{}{}:
+	default:
+	}
+	if cancelConn != nil {
+		cancelConn()
+	}
+}
+
+// newSliderValues returns n slider values set to the "unknown" sentinel, which
+// forces an event on the first real value.
+func newSliderValues(n int) []float32 {
+	values := make([]float32, n)
+	for i := range values {
+		values[i] = -1.0
+	}
+	return values
+}
+
+// preferIPv4Dial resolves host names over IPv4 first and only falls back to a
+// regular (dual-stack) dial if that fails. Go's built-in resolver waits for
+// both A and AAAA answers, and mDNS names of devices without IPv6 (typical
+// for ESPHome) never get an AAAA answer, which turns every connect into a
+// multi-second timeout.
+func preferIPv4Dial(dialer *net.Dialer) func(ctx context.Context, network, address string) (net.Conn, error) {
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		host, _, err := net.SplitHostPort(address)
+		if err != nil || net.ParseIP(host) != nil || network != "tcp" {
+			return dialer.DialContext(ctx, network, address)
+		}
+
+		conn, err := dialer.DialContext(ctx, "tcp4", address)
+		var dnsErr *net.DNSError
+		if err != nil && errors.As(err, &dnsErr) && ctx.Err() == nil {
+			return dialer.DialContext(ctx, network, address)
+		}
+		return conn, err
+	}
 }
 
 // eventsURL builds the SSE endpoint URL from the configured address, which may
@@ -256,19 +317,37 @@ func eventsURL(address string) string {
 func (esphome *ESPHome) sseLoop() {
 	defer close(esphome.done)
 
-	logger := esphome.logger.Named(esphome.deej.config.ESPHomeIpAddr)
-
 	backoff := sseReconnectBaseDelay
 
 	for {
-		wasConnected, err := esphome.runSSEStream(esphome.ctx, logger)
+		esphome.lock.Lock()
+		address := esphome.address
+		esphome.lock.Unlock()
+
+		logger := esphome.logger.Named(address)
+
+		wasConnected, err := esphome.runSSEStream(esphome.ctx, logger, address)
 
 		esphome.lock.Lock()
 		esphome.connected = false
-		if esphome.ctx.Err() == nil {
+		addressChanged := esphome.address != address
+		if esphome.ctx.Err() == nil && !addressChanged {
 			esphome.reconnectCount++
 		}
+		if addressChanged {
+			esphome.reconnectCount = 0
+		}
 		esphome.lock.Unlock()
+
+		// the config now points somewhere else: connect there right away
+		if addressChanged && esphome.ctx.Err() == nil {
+			select {
+			case <-esphome.reconnectNow:
+			default:
+			}
+			backoff = sseReconnectBaseDelay
+			continue
+		}
 
 		if esphome.ctx.Err() != nil {
 			logger.Debug("SSE loop stopped")
@@ -287,6 +366,9 @@ func (esphome *ESPHome) sseLoop() {
 		case <-esphome.ctx.Done():
 			logger.Debug("SSE loop stopped")
 			return
+		case <-esphome.reconnectNow:
+			backoff = sseReconnectBaseDelay
+			continue
 		case <-time.After(backoff):
 		}
 
@@ -301,11 +383,20 @@ func (esphome *ESPHome) sseLoop() {
 // It returns when the stream ends, an error occurs, the stream goes silent for
 // longer than the idle timeout, or ctx is cancelled. wasConnected reports
 // whether the HTTP connection was established successfully.
-func (esphome *ESPHome) runSSEStream(ctx context.Context, logger *zap.SugaredLogger) (wasConnected bool, err error) {
+func (esphome *ESPHome) runSSEStream(ctx context.Context, logger *zap.SugaredLogger, address string) (wasConnected bool, err error) {
 	connCtx, cancelConn := context.WithCancel(ctx)
 	defer cancelConn()
 
-	req, err := http.NewRequestWithContext(connCtx, http.MethodGet, eventsURL(esphome.deej.config.ESPHomeIpAddr), nil)
+	esphome.lock.Lock()
+	esphome.cancelConn = cancelConn
+	esphome.lock.Unlock()
+	defer func() {
+		esphome.lock.Lock()
+		esphome.cancelConn = nil
+		esphome.lock.Unlock()
+	}()
+
+	req, err := http.NewRequestWithContext(connCtx, http.MethodGet, eventsURL(address), nil)
 	if err != nil {
 		return false, fmt.Errorf("build SSE request: %w", err)
 	}
@@ -391,7 +482,10 @@ func (esphome *ESPHome) findSliderIndex(id string) int {
 		slug = strings.TrimPrefix(id, "sensor-")
 	}
 
-	for i, name := range esphome.deej.config.ESPHomeSliderNames {
+	esphome.lock.Lock()
+	defer esphome.lock.Unlock()
+
+	for i, name := range esphome.sliderNames {
 		if slug == name {
 			return i
 		}

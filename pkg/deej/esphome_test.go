@@ -4,11 +4,7 @@ import "testing"
 
 func TestFindSliderIndex(t *testing.T) {
 	esphome := &ESPHome{
-		deej: &Deej{
-			config: &CanonicalConfig{
-				ESPHomeSliderNames: []string{"input_0", "input_1", "input_2"},
-			},
-		},
+		sliderNames: []string{"input_0", "input_1", "input_2"},
 	}
 
 	cases := []struct {

@@ -111,21 +111,21 @@ func updateTrayStatus(d *Deej, connItem, sliderItem, sessionItem *systray.MenuIt
 	// Connection status line
 	if status.Connected {
 		uptime := time.Since(status.ConnectedSince).Round(time.Second)
-		connLine := fmt.Sprintf("ESPHome %s ✓ (up %s)", status.IPAddress, uptime)
+		connLine := fmt.Sprintf("ESPHome %s ✓ (up %s)", status.Address, uptime)
 		if status.ReconnectCount > 0 {
 			connLine += fmt.Sprintf(", %d reconnect(s)", status.ReconnectCount)
 		}
 		setStatusTitle(connItem, connLine)
 	} else {
 		if status.ReconnectCount > 0 {
-			setStatusTitle(connItem, fmt.Sprintf("ESPHome %s ✗ (reconnecting, attempt %d)", status.IPAddress, status.ReconnectCount+1))
+			setStatusTitle(connItem, fmt.Sprintf("ESPHome %s ✗ (reconnecting, attempt %d)", status.Address, status.ReconnectCount+1))
 		} else {
-			setStatusTitle(connItem, fmt.Sprintf("ESPHome %s ✗ (connecting…)", status.IPAddress))
+			setStatusTitle(connItem, fmt.Sprintf("ESPHome %s ✗ (connecting…)", status.Address))
 		}
 	}
 
 	// Slider values line
-	sliderNames := d.config.ESPHomeSliderNames
+	sliderNames := status.SliderNames
 	if len(status.SliderValues) > 0 {
 		parts := make([]string, 0, len(status.SliderValues))
 		for i, v := range status.SliderValues {

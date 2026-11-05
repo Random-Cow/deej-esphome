@@ -12,7 +12,7 @@ make dev            # debug build: verbose, colourful logs on stderr
 make all            # gofmt check, go vet, golangci-lint (if installed), tests, release build
 ```
 
-To try changes without hardware, point `esphome_ip` at anything that serves an ESPHome-style `/events` stream. The tests in `pkg/deej/esphome_stream_test.go` show what that stream looks like.
+To try changes without hardware, point `esphome_address` at anything that serves an ESPHome-style `/events` stream. The tests in `pkg/deej/esphome_stream_test.go` show what that stream looks like.
 
 If you change `esphome/deej-esphome.yaml`, validate it with `esphome config esphome/deej-esphome.yaml`. You need a `secrets.yaml` with `wifi_ssid` and `wifi_password` next to it; CI runs the same check.
 

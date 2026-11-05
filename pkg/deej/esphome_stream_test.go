@@ -3,6 +3,7 @@ package deej
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -18,9 +19,10 @@ func newTestESPHome(t *testing.T, address string, sliders ...string) *ESPHome {
 	d := &Deej{
 		logger: zap.NewNop().Sugar(),
 		config: &CanonicalConfig{
-			ESPHomeIpAddr:       address,
+			ESPHomeAddress:      address,
 			ESPHomeSliderNames:  sliders,
 			NoiseReductionLevel: "low",
+			logger:              zap.NewNop().Sugar(),
 		},
 	}
 
@@ -153,7 +155,7 @@ func TestRunSSEStreamParsesStateEvents(t *testing.T) {
 
 	esphome := newTestESPHome(t, strings.TrimPrefix(srv.URL, "http://"), "input_0", "input_1")
 
-	go func() { _, _ = esphome.runSSEStream(esphome.ctx, esphome.logger) }()
+	go func() { _, _ = esphome.runSSEStream(esphome.ctx, esphome.logger, esphome.address) }()
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -175,7 +177,7 @@ func TestRunSSEStreamRejectsNon200(t *testing.T) {
 
 	esphome := newTestESPHome(t, strings.TrimPrefix(srv.URL, "http://"), "input_0")
 
-	wasConnected, err := esphome.runSSEStream(context.Background(), esphome.logger)
+	wasConnected, err := esphome.runSSEStream(context.Background(), esphome.logger, esphome.address)
 	if wasConnected || err == nil || !strings.Contains(err.Error(), "404") {
 		t.Fatalf("got wasConnected=%v err=%v, want a 404 error", wasConnected, err)
 	}
@@ -189,7 +191,7 @@ func TestRunSSEStreamIdleTimeout(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := esphome.runSSEStream(context.Background(), esphome.logger)
+		_, err := esphome.runSSEStream(context.Background(), esphome.logger, esphome.address)
 		done <- err
 	}()
 
@@ -228,6 +230,69 @@ func TestStopWhileConnectedReturnsPromptly(t *testing.T) {
 	case <-esphome.done:
 	default:
 		t.Fatal("SSE loop still running after Stop")
+	}
+}
+
+// Changing the address in the config must move the live connection over to
+// the new device without a restart.
+func TestAddressChangeReconnects(t *testing.T) {
+	oldDevice := sseServer(t, stateFrame(`{"id":"sensor-input_0","value":10}`))
+	newDevice := sseServer(t, stateFrame(`{"id":"sensor-input_0","value":90}`))
+
+	esphome := newTestESPHome(t, strings.TrimPrefix(oldDevice.URL, "http://"), "input_0")
+	if err := esphome.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	waitForSlider(t, esphome, 0, 0.1)
+
+	cfg := esphome.deej.config
+	cfg.ESPHomeAddress = strings.TrimPrefix(newDevice.URL, "http://")
+	cfg.ESPHomeSliderNames = []string{"input_0", "input_1"}
+	cfg.onConfigReloaded()
+
+	waitForSlider(t, esphome, 0, 0.9)
+
+	status := esphome.GetStatus()
+	if status.Address != cfg.ESPHomeAddress {
+		t.Errorf("status address = %q, want %q", status.Address, cfg.ESPHomeAddress)
+	}
+	if len(status.SliderValues) != 2 {
+		t.Errorf("got %d slider values after reload, want 2", len(status.SliderValues))
+	}
+}
+
+func waitForSlider(t *testing.T, esphome *ESPHome, idx int, want float32) {
+	t.Helper()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if v := esphome.GetCurrentSliderValues(); idx < len(v) && v[idx] == want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("slider %d = %v, want %v", idx, esphome.GetCurrentSliderValues(), want)
+}
+
+func TestPreferIPv4DialUsesIPv4ForHostnames(t *testing.T) {
+	srv := sseServer(t)
+	_, port, _ := strings.Cut(strings.TrimPrefix(srv.URL, "http://"), ":")
+
+	var networks []string
+	dial := preferIPv4Dial(&net.Dialer{Timeout: time.Second})
+	recording := func(ctx context.Context, network, address string) (net.Conn, error) {
+		networks = append(networks, network)
+		return dial(ctx, network, address)
+	}
+
+	conn, err := recording(context.Background(), "tcp", "localhost:"+port)
+	if err != nil {
+		t.Fatalf("dial localhost: %v", err)
+	}
+	_ = conn.Close()
+
+	if len(networks) != 1 || networks[0] != "tcp" {
+		t.Fatalf("unexpected outer calls %v", networks)
 	}
 }
 

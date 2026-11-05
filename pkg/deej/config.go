@@ -21,7 +21,7 @@ type CanonicalConfig struct {
 
 	InvertSliders bool
 
-	ESPHomeIpAddr      string
+	ESPHomeAddress     string
 	ESPHomeSliderNames []string
 
 	NoiseReductionLevel string
@@ -46,7 +46,10 @@ const (
 	configKeyInvertSliders       = "invert_sliders"
 	configKeyNoiseReductionLevel = "noise_reduction"
 	configKeyESPHomeMapping      = "esphome_mapping"
-	configKeyESPHomeIp           = "esphome_ip"
+	configKeyESPHomeAddress      = "esphome_address"
+
+	// deprecated alias of esphome_address, still read for older configs
+	configKeyESPHomeIpLegacy = "esphome_ip"
 )
 
 // userConfigFilepath and userConfigPath become vars to allow Linux specific override (~/.config/deej)
@@ -153,7 +156,7 @@ func (cc *CanonicalConfig) Load() error {
 	cc.logger.Infow("Config values",
 		"sliderMapping", cc.SliderMapping,
 		"invertSliders", cc.InvertSliders,
-		"esphomeIP", cc.ESPHomeIpAddr,
+		"esphomeAddress", cc.ESPHomeAddress,
 		"esphomeMapping", cc.ESPHomeSliderNames)
 
 	return nil
@@ -232,7 +235,12 @@ func (cc *CanonicalConfig) populateFromVipers() error {
 	)
 
 	cc.InvertSliders = cc.userConfig.GetBool(configKeyInvertSliders)
-	cc.ESPHomeIpAddr = cc.userConfig.GetString(configKeyESPHomeIp)
+	cc.ESPHomeAddress = cc.userConfig.GetString(configKeyESPHomeAddress)
+	if cc.ESPHomeAddress == "" && cc.userConfig.IsSet(configKeyESPHomeIpLegacy) {
+		cc.ESPHomeAddress = cc.userConfig.GetString(configKeyESPHomeIpLegacy)
+		cc.logger.Warnw("Config key is deprecated, please rename it",
+			"old", configKeyESPHomeIpLegacy, "new", configKeyESPHomeAddress)
+	}
 	cc.ESPHomeSliderNames = cc.userConfig.GetStringSlice(configKeyESPHomeMapping)
 	cc.NoiseReductionLevel = cc.userConfig.GetString(configKeyNoiseReductionLevel)
 
@@ -244,8 +252,8 @@ func (cc *CanonicalConfig) populateFromVipers() error {
 // validate checks for settings deej can't run without, so the user gets a
 // clear message instead of a silently idle mixer.
 func (cc *CanonicalConfig) validate() error {
-	if strings.TrimSpace(cc.ESPHomeIpAddr) == "" {
-		return fmt.Errorf("%s is not set in %s", configKeyESPHomeIp, userConfigFilepath)
+	if strings.TrimSpace(cc.ESPHomeAddress) == "" {
+		return fmt.Errorf("%s is not set in %s", configKeyESPHomeAddress, userConfigFilepath)
 	}
 
 	if len(cc.ESPHomeSliderNames) == 0 {
