@@ -479,8 +479,11 @@ func (m *sessionMap) get(key string) ([]Session, bool) {
 // getMatching returns all sessions whose key exactly matches the target, or
 // if the target is a glob pattern, all sessions whose key matches the pattern.
 func (m *sessionMap) getMatching(target string) ([]Session, bool) {
-	if !isGlobPattern(target) {
-		return m.get(target)
+	// exact match first: session keys can themselves contain glob
+	// metacharacters (e.g. "[...]"), and deej.unmapped resolves to raw keys,
+	// which would otherwise be misread as patterns that don't match themselves.
+	if sessions, ok := m.get(target); ok || !isGlobPattern(target) {
+		return sessions, ok
 	}
 
 	m.lock.Lock()

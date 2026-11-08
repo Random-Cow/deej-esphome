@@ -3,6 +3,7 @@ package deej
 import (
 	"fmt"
 	"net"
+	"strings"
 
 	"github.com/jfreymuth/pulse/proto"
 	"go.uber.org/zap"
@@ -261,9 +262,25 @@ func (sf *paSessionFinder) resolveSessionName(
 
 	for _, c := range candidates {
 		if v := fromProps(c.props, c.key); v != "" {
-			return v, c.source
+			return unwrapALSAName(v), c.source
 		}
 	}
 
 	return "", ""
+}
+
+// unwrapALSAName strips the generic wrapper that PipeWire's ALSA plugin puts
+// around the application name ("PipeWire ALSA [music-assistant-companion]"),
+// so ALSA clients can be matched by their binary name like any other app.
+// Other names are returned unchanged.
+func unwrapALSAName(name string) string {
+	const prefix = "PipeWire ALSA ["
+
+	if strings.HasPrefix(name, prefix) && strings.HasSuffix(name, "]") {
+		if inner := strings.TrimSpace(name[len(prefix) : len(name)-1]); inner != "" {
+			return inner
+		}
+	}
+
+	return name
 }
